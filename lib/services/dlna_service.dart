@@ -28,11 +28,11 @@ class DlnaService {
 
   // ── Device Discovery ────────────────────────────────────────────────────────
 
-  Future<List<DlnaDevice>> discover({Duration timeout = const Duration(seconds: 6)}) async {
+  /// Discovers DLNA renderers. Returns results as they're found up to [timeout].
+  /// Default timeout reduced to 4 seconds for snappier UX.
+  Future<List<DlnaDevice>> discover({Duration timeout = const Duration(seconds: 4)}) async {
     final devices = <DlnaDevice>[];
     final seen = <String>{};
-    // Run both searches in parallel with the FULL timeout each (previously
-    // they were sequential and each got only half the budget).
     await Future.wait(
       _searchTargets.map((target) => _ssdpSearch(
             searchTarget: target,
@@ -42,6 +42,82 @@ class DlnaService {
           )),
     );
     return devices;
+  }
+
+  /// Stream-based discovery that yields devices as they arrive.
+  /// This is used for *live updating* UI — devices appear immediately.
+  Stream<DlnaDevice> discoverStream({Duration timeout = const Duration(seconds: 5)}) async* {
+    final controller = StreamController<DlnaDevice>();
+    final seen = <String>{};
+
+    Future<void> search(String target) async {
+      RawDatagramSocket? socket;
+      try {
+        socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+        socket.multicastHops = 4;
+        socket.broadcastEnabled = true;
+
+        final message = utf8.encode(
+          'M-SEARCH * HTTP/1.1\r\n'
+          'HOST: $_ssdpAddress:$_ssdpPort\r\n'
+          'MAN: "ssdp:discover"\r\n'
+          'MX: 2\r\n'
+          'ST: $target\r\n'
+          '\r\n',
+        );
+
+        // Send the search packet 3 times for reliability (UDP can drop packets).
+        socket.send(message, InternetAddress(_ssdpAddress), _ssdpPort);
+        await Future.delayed(const Duration(milliseconds: 100));
+        socket.send(message, InternetAddress(_ssdpAddress), _ssdpPort);
+        await Future.delayed(const Duration(milliseconds: 200));
+        socket.send(message, InternetAddress(_ssdpAddress), _ssdpPort);
+
+        final completer = Completer<void>();
+        final timer = Timer(timeout, () {
+          if (!completer.isCompleted) completer.complete();
+        });
+
+        socket.listen((event) async {
+          if (event == RawSocketEvent.read) {
+            final datagram = socket!.receive();
+            if (datagram == null) return;
+            final text = utf8.decode(datagram.data, allowMalformed: true);
+            final m = RegExp(r'LOCATION:\s*(\S+)', caseSensitive: false).firstMatch(text);
+            if (m == null) return;
+            final location = m.group(1)!.trim();
+            if (seen.contains(location)) return;
+            seen.add(location);
+            try {
+              final device = await _fetchDeviceInfo(location);
+              if (device != null && !controller.isClosed) {
+                controller.add(device);
+              }
+            } catch (_) {}
+          }
+        });
+
+        await completer.future;
+        timer.cancel();
+      } catch (_) {
+      } finally {
+        socket?.close();
+      }
+    }
+
+    // Run both searches in parallel
+    final searchFuture = Future.wait(
+      _searchTargets.map((t) => search(t)),
+    );
+
+    // Yield devices as they arrive
+    yield* controller.stream.timeout(
+      timeout + const Duration(seconds: 1),
+      onTimeout: (sink) => sink.close(),
+    );
+
+    await searchFuture;
+    await controller.close();
   }
 
   Future<void> _ssdpSearch({
@@ -60,11 +136,16 @@ class DlnaService {
         'M-SEARCH * HTTP/1.1\r\n'
         'HOST: $_ssdpAddress:$_ssdpPort\r\n'
         'MAN: "ssdp:discover"\r\n'
-        'MX: 3\r\n'
+        'MX: 2\r\n'
         'ST: $searchTarget\r\n'
         '\r\n',
       );
 
+      // Send multiple times — UDP is unreliable.
+      socket.send(message, InternetAddress(_ssdpAddress), _ssdpPort);
+      await Future.delayed(const Duration(milliseconds: 100));
+      socket.send(message, InternetAddress(_ssdpAddress), _ssdpPort);
+      await Future.delayed(const Duration(milliseconds: 200));
       socket.send(message, InternetAddress(_ssdpAddress), _ssdpPort);
 
       final completer = Completer<void>();

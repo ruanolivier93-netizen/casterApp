@@ -14,7 +14,7 @@ class VideoExtractorService {
     }
 
     final host = uri.host.toLowerCase();
-    if (host.contains('youtube.com') || host.contains('youtu.be')) {
+    if (host.contains('youtube.com') || host.contains('youtu.be') || host.contains('m.youtube.com')) {
       return _extractYouTube(url);
     }
     return _extractDirect(url);
@@ -119,24 +119,27 @@ class VideoExtractorService {
   }
 
   Future<VideoInfo> _extractDirect(String url) async {
-    final isLikelyVideo = url.contains('.mp4') ||
-        url.contains('.m3u8') ||
-        url.contains('.webm') ||
-        url.contains('.mkv') ||
-        url.contains('.avi') ||
-        url.contains('.mov');
+    final isLikelyVideo = RegExp(
+      r'\.(mp4|m3u8|webm|mkv|avi|mov|flv|ts|mpd|m4v|3gp|wmv)(\?|#|$)',
+      caseSensitive: false,
+    ).hasMatch(url);
 
     if (!isLikelyVideo) {
       try {
         final response = await http.head(Uri.parse(url)).timeout(const Duration(seconds: 8));
         final ct = response.headers['content-type'] ?? '';
         if (!ct.contains('video/') &&
+            !ct.contains('audio/') &&
             !ct.contains('application/x-mpegurl') &&
             !ct.contains('application/vnd.apple.mpegurl') &&
+            !ct.contains('application/dash+xml') &&
             !ct.contains('application/octet-stream')) {
           throw Exception(
-            'This URL doesn\'t appear to be a direct video link.\n'
-            'Supported: YouTube, or direct .mp4 / .m3u8 / .webm URLs.',
+            'This URL doesn\'t appear to be a direct video link.\n\n'
+            'Supported:\n'
+            '• YouTube links (full URL or short URL)\n'
+            '• Direct video files (.mp4, .m3u8, .webm, .mkv, etc.)\n\n'
+            'Tip: Use the Browser tab to find and detect video URLs on any page.',
           );
         }
       } catch (e) {

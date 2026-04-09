@@ -15,6 +15,7 @@ class HomeScreen extends ConsumerStatefulWidget {
 class _HomeScreenState extends ConsumerState<HomeScreen> {
   final _urlController = TextEditingController();
   final _scroll = ScrollController();
+  bool _autoScanned = false;
 
   @override
   void dispose() {
@@ -39,17 +40,32 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     ref.read(selectedDeviceProvider.notifier).state = null;
     ref.read(selectedSubtitleProvider.notifier).state = null;
     ref.read(videoProvider.notifier).extract(url);
+    _autoScanned = false;
     FocusScope.of(context).unfocus();
   }
 
   @override
   Widget build(BuildContext context) {
     final videoState = ref.watch(videoProvider);
-    final formatSelected = ref.watch(selectedFormatProvider) != null;
+    final devicesState = ref.watch(devicesProvider);
+    final selectedFormat = ref.watch(selectedFormatProvider);
+    final selectedDevice = ref.watch(selectedDeviceProvider);
     final castState = ref.watch(castProvider);
     final isCasting = castState is CastPlaying;
+    final cs = Theme.of(context).colorScheme;
 
-    // If a URL was injected from the in-app browser, fill the text field.
+    // Auto-scan for TVs when video loads (only once per extract).
+    if (videoState is VideoLoaded && !_autoScanned) {
+      _autoScanned = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        final ds = ref.read(devicesProvider);
+        if (ds is! DevicesScanning) {
+          ref.read(devicesProvider.notifier).scan();
+        }
+      });
+    }
+
+    // Auto-fill URL from browser cast button.
     final browserUrl = ref.watch(browserCastUrlProvider);
     if (browserUrl != null && browserUrl.isNotEmpty) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -78,50 +94,8 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         controller: _scroll,
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
         children: [
-          // ── Step 1: URL input ────────────────────────────────────────────────
-          _StepCard(
-            step: 1,
-            title: 'Paste a video URL',
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                TextField(
-                  controller: _urlController,
-                  decoration: InputDecoration(
-                    hintText: 'YouTube URL, or direct .mp4 / .m3u8…',
-                    prefixIcon: const Icon(Icons.link),
-                    suffixIcon: videoState is VideoLoading
-                        ? const Padding(
-                            padding: EdgeInsets.all(12),
-                            child: SizedBox(
-                              width: 20,
-                              height: 20,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                          )
-                        : IconButton(
-                            icon: const Icon(Icons.search),
-                            onPressed: _extract,
-                          ),
-                    border: const OutlineInputBorder(),
-                  ),
-                  keyboardType: TextInputType.url,
-                  textInputAction: TextInputAction.go,
-                  onSubmitted: (_) => _extract(),
-                ),
-                if (videoState is VideoError) ...[
-                  const SizedBox(height: 8),
-                  _ErrorBanner(videoState.message),
-                  const SizedBox(height: 6),
-                  TextButton.icon(
-                    icon: const Icon(Icons.refresh, size: 16),
-                    label: const Text('Retry'),
-                    onPressed: _extract,
-                  ),
-                ],
-              ],
-            ),
-          ),
+          // ── URL input ────────────────────────────────────────────────────
+          _buildUrlInput(videoState, cs),
 
           // ── Cast History (shown when idle) ────────────────────────────────
           if (videoState is VideoIdle) ...[
@@ -129,39 +103,96 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
             const _CastHistory(),
           ],
 
-          // ── Step 2: Video info + format picker ───────────────────────────────
+          // ── Video info + format picker + device + cast button ─────────────
           if (videoState is VideoLoaded) ...[
             const SizedBox(height: 12),
-            _StepCard(
-              step: 2,
-              title: 'Choose quality',
-              child: _FormatPicker(info: videoState.info),
-            ),
-          ],
-
-          // ── Step 3: Device discovery ─────────────────────────────────────────
-          if (videoState is VideoLoaded && formatSelected) ...[
+            _VideoInfoCard(info: videoState.info),
             const SizedBox(height: 12),
-            _StepCard(
-              step: 3,
-              title: 'Find your TV',
-              child: const _DeviceList(),
+            _FormatPicker(info: videoState.info),
+          ],
+
+          // ── Device selection (shown once we have a video) ────────────────
+          if (videoState is VideoLoaded) ...[
+            const SizedBox(height: 12),
+            _DeviceSection(
+              devicesState: devicesState,
+              selectedDevice: selectedDevice,
             ),
           ],
 
-          // ── Step 4: Cast controls ────────────────────────────────────────────
+          // ── BIG CAST BUTTON — the star of the show ───────────────────────
+          if (videoState is VideoLoaded &&
+              selectedFormat != null &&
+              selectedDevice != null &&
+              castState is! CastPlaying &&
+              castState is! CastPreparing) ...[
+            const SizedBox(height: 16),
+            _CastNowButton(
+              videoState: videoState,
+              format: selectedFormat,
+              device: selectedDevice,
+            ),
+          ],
+
+          // ── Cast controls ────────────────────────────────────────────────
           if (isCasting || castState is CastPreparing || castState is CastError) ...[
             const SizedBox(height: 12),
-            _StepCard(
-              step: 4,
-              title: 'Now casting',
-              child: const _CastControls(),
-            ),
+            _CastControls(videoState: videoState),
           ],
         ],
       ),
-      // ── Bottom: Route-through-phone toggle ──────────────────────────────────
       persistentFooterButtons: [const _RouteToggleBar()],
+    );
+  }
+
+  Widget _buildUrlInput(VideoState videoState, ColorScheme cs) {
+    return Card(
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: cs.outlineVariant),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.all(16),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            TextField(
+              controller: _urlController,
+              decoration: InputDecoration(
+                hintText: 'Paste YouTube URL or direct video link…',
+                prefixIcon: const Icon(Icons.link),
+                suffixIcon: videoState is VideoLoading
+                    ? const Padding(
+                        padding: EdgeInsets.all(12),
+                        child: SizedBox(
+                          width: 20, height: 20,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      )
+                    : IconButton(
+                        icon: const Icon(Icons.search),
+                        onPressed: _extract,
+                      ),
+                border: const OutlineInputBorder(),
+              ),
+              keyboardType: TextInputType.url,
+              textInputAction: TextInputAction.go,
+              onSubmitted: (_) => _extract(),
+            ),
+            if (videoState is VideoError) ...[
+              const SizedBox(height: 8),
+              _ErrorBanner(videoState.message),
+              const SizedBox(height: 6),
+              TextButton.icon(
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Retry'),
+                onPressed: _extract,
+              ),
+            ],
+          ],
+        ),
+      ),
     );
   }
 
@@ -177,98 +208,11 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   }
 }
 
-// ── _StepCard ─────────────────────────────────────────────────────────────────
+// ── Video Info Card ──────────────────────────────────────────────────────────
 
-class _StepCard extends StatelessWidget {
-  final int step;
-  final String title;
-  final Widget child;
-
-  const _StepCard({required this.step, required this.title, required this.child});
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16),
-        side: BorderSide(color: cs.outlineVariant),
-      ),
-      child: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(
-              children: [
-                CircleAvatar(
-                  radius: 12,
-                  backgroundColor: cs.primary,
-                  child: Text(
-                    '$step',
-                    style: TextStyle(
-                      fontSize: 12,
-                      fontWeight: FontWeight.bold,
-                      color: cs.onPrimary,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 8),
-                Text(title,
-                    style: Theme.of(context)
-                        .textTheme
-                        .titleSmall
-                        ?.copyWith(fontWeight: FontWeight.w600)),
-              ],
-            ),
-            const SizedBox(height: 14),
-            child,
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ── _ErrorBanner ──────────────────────────────────────────────────────────────
-
-class _ErrorBanner extends StatelessWidget {
-  final String message;
-  const _ErrorBanner(this.message);
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-      decoration: BoxDecoration(
-        color: cs.errorContainer,
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Row(children: [
-        Icon(Icons.error_outline, size: 18, color: cs.onErrorContainer),
-        const SizedBox(width: 8),
-        Expanded(
-          child: Text(message,
-              style: TextStyle(color: cs.onErrorContainer, fontSize: 13)),
-        ),
-      ]),
-    );
-  }
-}
-
-// ── _FormatPicker ─────────────────────────────────────────────────────────────
-
-class _FormatPicker extends ConsumerWidget {
+class _VideoInfoCard extends StatelessWidget {
   final VideoInfo info;
-  const _FormatPicker({required this.info});
-
-  String _fmtSize(int? bytes) {
-    if (bytes == null) return '';
-    final mb = bytes / (1024 * 1024);
-    return mb >= 1024 ? '${(mb / 1024).toStringAsFixed(1)} GB' : '${mb.toStringAsFixed(0)} MB';
-  }
+  const _VideoInfoCard({required this.info});
 
   String _fmtDuration(int? secs) {
     if (secs == null) return '';
@@ -280,64 +224,85 @@ class _FormatPicker extends ConsumerWidget {
   }
 
   @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (info.thumbnailUrl != null)
+          ClipRRect(
+            borderRadius: BorderRadius.circular(8),
+            child: CachedNetworkImage(
+              imageUrl: info.thumbnailUrl!,
+              width: 110,
+              height: 66,
+              fit: BoxFit.cover,
+              errorWidget: (_, __, ___) => Container(
+                width: 110, height: 66,
+                color: cs.surfaceContainerHighest,
+                child: const Icon(Icons.video_file),
+              ),
+            ),
+          ),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(info.title,
+                  style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+                  maxLines: 2, overflow: TextOverflow.ellipsis),
+              const SizedBox(height: 4),
+              Text(
+                [
+                  if (info.uploader != null) info.uploader!,
+                  if (info.durationSeconds != null) _fmtDuration(info.durationSeconds),
+                  '${info.formats.length} format${info.formats.length == 1 ? '' : 's'}',
+                ].join(' · '),
+                style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+// ── Format Picker ────────────────────────────────────────────────────────────
+
+class _FormatPicker extends ConsumerWidget {
+  final VideoInfo info;
+  const _FormatPicker({required this.info});
+
+  String _fmtSize(int? bytes) {
+    if (bytes == null) return '';
+    final mb = bytes / (1024 * 1024);
+    return mb >= 1024 ? '${(mb / 1024).toStringAsFixed(1)} GB' : '${mb.toStringAsFixed(0)} MB';
+  }
+
+  @override
   Widget build(BuildContext context, WidgetRef ref) {
     final selected = ref.watch(selectedFormatProvider);
+    final cs = Theme.of(context).colorScheme;
+
+    // Auto-select highest quality muxed stream
+    if (selected == null && info.formats.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        ref.read(selectedFormatProvider.notifier).state = info.formats.first;
+      });
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // Video info row
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            if (info.thumbnailUrl != null)
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: CachedNetworkImage(
-                  imageUrl: info.thumbnailUrl!,
-                  width: 100,
-                  height: 60,
-                  fit: BoxFit.cover,
-                  errorWidget: (_, __, ___) => Container(
-                    width: 100,
-                    height: 60,
-                    color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                    child: const Icon(Icons.video_file),
-                  ),
-                ),
-              ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(info.title,
-                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                      maxLines: 2,
-                      overflow: TextOverflow.ellipsis),
-                  const SizedBox(height: 4),
-                  Text(
-                    [
-                      if (info.uploader != null) info.uploader!,
-                      if (info.durationSeconds != null) _fmtDuration(info.durationSeconds),
-                    ].join(' · '),
-                    style:
-                        TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontSize: 12),
-                  ),
-                ],
-              ),
-            ),
-          ],
-        ),
-
-        const SizedBox(height: 14),
-
-        // Format list
+        Text('Quality', style: TextStyle(
+          fontWeight: FontWeight.w600, fontSize: 13, color: cs.onSurfaceVariant)),
+        const SizedBox(height: 6),
         ...info.formats.map((f) {
           final isSelected = selected?.id == f.id;
-          final cs = Theme.of(context).colorScheme;
           return Padding(
-            padding: const EdgeInsets.only(bottom: 6),
+            padding: const EdgeInsets.only(bottom: 4),
             child: InkWell(
               borderRadius: BorderRadius.circular(10),
               onTap: () => ref.read(selectedFormatProvider.notifier).state = f,
@@ -351,7 +316,7 @@ class _FormatPicker extends ConsumerWidget {
                   borderRadius: BorderRadius.circular(10),
                   color: isSelected ? cs.primaryContainer.withAlpha(80) : null,
                 ),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 child: Row(
                   children: [
                     Icon(
@@ -360,22 +325,13 @@ class _FormatPicker extends ConsumerWidget {
                       color: isSelected ? cs.primary : cs.onSurfaceVariant,
                     ),
                     const SizedBox(width: 10),
-                    Expanded(
-                      child: Text(
-                        f.label,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight:
-                              isSelected ? FontWeight.w600 : FontWeight.normal,
-                        ),
-                      ),
-                    ),
+                    Expanded(child: Text(f.label, style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                    ))),
                     if (f.filesize != null)
-                      Text(
-                        _fmtSize(f.filesize),
-                        style: TextStyle(
-                            fontSize: 12, color: cs.onSurfaceVariant),
-                      ),
+                      Text(_fmtSize(f.filesize),
+                          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
                     if (isSelected) ...[
                       const SizedBox(width: 8),
                       Icon(Icons.check_circle, size: 18, color: cs.primary),
@@ -387,14 +343,11 @@ class _FormatPicker extends ConsumerWidget {
           );
         }),
 
-        // ── Subtitle picker ─────────────────────────────────────────────
+        // Subtitles
         if (info.subtitles.isNotEmpty) ...[
-          const SizedBox(height: 14),
-          Text('Subtitles',
-              style: TextStyle(
-                  fontWeight: FontWeight.w600,
-                  fontSize: 13,
-                  color: Theme.of(context).colorScheme.onSurfaceVariant)),
+          const SizedBox(height: 10),
+          Text('Subtitles', style: TextStyle(
+            fontWeight: FontWeight.w600, fontSize: 13, color: cs.onSurfaceVariant)),
           const SizedBox(height: 6),
           _SubtitlePicker(subtitles: info.subtitles),
         ],
@@ -403,7 +356,7 @@ class _FormatPicker extends ConsumerWidget {
   }
 }
 
-// ── _SubtitlePicker ───────────────────────────────────────────────────────────
+// ── Subtitle Picker ─────────────────────────────────────────────────────────
 
 class _SubtitlePicker extends ConsumerWidget {
   final List<SubtitleTrack> subtitles;
@@ -412,13 +365,9 @@ class _SubtitlePicker extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final selected = ref.watch(selectedSubtitleProvider);
-    final cs = Theme.of(context).colorScheme;
-
     return Wrap(
-      spacing: 6,
-      runSpacing: 4,
+      spacing: 6, runSpacing: 4,
       children: [
-        // "None" chip
         ChoiceChip(
           label: const Text('None', style: TextStyle(fontSize: 12)),
           selected: selected == null,
@@ -429,7 +378,6 @@ class _SubtitlePicker extends ConsumerWidget {
               label: Text(s.label, style: const TextStyle(fontSize: 12)),
               selected: selected?.language == s.language,
               onSelected: (_) => ref.read(selectedSubtitleProvider.notifier).state = s,
-              avatar: Icon(Icons.subtitles, size: 14, color: cs.onSurfaceVariant),
               visualDensity: VisualDensity.compact,
             )),
       ],
@@ -437,7 +385,425 @@ class _SubtitlePicker extends ConsumerWidget {
   }
 }
 
-// ── _CastHistory ──────────────────────────────────────────────────────────────
+// ── Device Section ──────────────────────────────────────────────────────────
+
+class _DeviceSection extends ConsumerWidget {
+  final DevicesState devicesState;
+  final DlnaDevice? selectedDevice;
+  const _DeviceSection({required this.devicesState, required this.selectedDevice});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final cs = Theme.of(context).colorScheme;
+    final lastDeviceLocation = ref.watch(lastDeviceProvider);
+
+    // Collect available devices from both scanning and result states.
+    final List<DlnaDevice> devices;
+    final bool isScanning;
+    if (devicesState is DevicesScanning) {
+      devices = (devicesState as DevicesScanning).devicesFoundSoFar;
+      isScanning = true;
+    } else if (devicesState is DevicesResult) {
+      devices = (devicesState as DevicesResult).devices;
+      isScanning = false;
+    } else {
+      devices = [];
+      isScanning = devicesState is DevicesScanning;
+    }
+
+    // Auto-select last used device as soon as it appears
+    if (selectedDevice == null && lastDeviceLocation != null && devices.isNotEmpty) {
+      final match = devices.where((d) => d.location == lastDeviceLocation).firstOrNull;
+      if (match != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          ref.read(selectedDeviceProvider.notifier).state = match;
+        });
+      }
+    }
+
+    // Auto-select if only one device found and scan is complete
+    if (selectedDevice == null && !isScanning && devices.length == 1) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        ref.read(selectedDeviceProvider.notifier).state = devices.first;
+      });
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.tv, size: 18, color: cs.onSurfaceVariant),
+            const SizedBox(width: 6),
+            Text('Cast to', style: TextStyle(
+              fontWeight: FontWeight.w600, fontSize: 13, color: cs.onSurfaceVariant)),
+            const Spacer(),
+            if (isScanning) ...[
+              SizedBox(width: 14, height: 14,
+                child: CircularProgressIndicator(strokeWidth: 2, color: cs.primary)),
+              const SizedBox(width: 6),
+              Text('Scanning…', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+            ] else
+              TextButton.icon(
+                icon: const Icon(Icons.refresh, size: 14),
+                label: const Text('Rescan', style: TextStyle(fontSize: 12)),
+                onPressed: () => ref.read(devicesProvider.notifier).scan(),
+              ),
+          ],
+        ),
+        const SizedBox(height: 6),
+
+        if (devices.isEmpty && !isScanning && devicesState is! DevicesIdle)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Column(
+              children: [
+                Text(
+                  'No TVs found. Make sure your TV is on and connected to the same WiFi.',
+                  style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13),
+                ),
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  icon: const Icon(Icons.refresh, size: 16),
+                  label: const Text('Scan again'),
+                  onPressed: () => ref.read(devicesProvider.notifier).scan(),
+                ),
+              ],
+            ),
+          ),
+
+        if (devices.isEmpty && (isScanning || devicesState is DevicesIdle))
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            child: Text('Looking for TVs on your network…',
+                style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13)),
+          ),
+
+        ...devices.map((d) {
+          final isSelected = selectedDevice == d;
+          return Padding(
+            padding: const EdgeInsets.only(bottom: 4),
+            child: ListTile(
+              dense: true,
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(10),
+                side: BorderSide(
+                  color: isSelected ? cs.primary : cs.outlineVariant,
+                  width: isSelected ? 2 : 1,
+                ),
+              ),
+              tileColor: isSelected ? cs.primaryContainer.withAlpha(80) : null,
+              leading: Icon(Icons.tv, color: isSelected ? cs.primary : cs.onSurfaceVariant, size: 22),
+              title: Text(d.name,
+                  style: TextStyle(
+                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                    fontSize: 14,
+                  )),
+              subtitle: d.manufacturer.isNotEmpty
+                  ? Text(d.manufacturer, style: const TextStyle(fontSize: 11))
+                  : null,
+              trailing: isSelected
+                  ? Icon(Icons.check_circle, color: cs.primary, size: 20)
+                  : null,
+              onTap: () => ref.read(selectedDeviceProvider.notifier).state = d,
+            ),
+          );
+        }),
+
+        if (devicesState is DevicesError) ...[
+          const SizedBox(height: 8),
+          _ErrorBanner((devicesState as DevicesError).message),
+          const SizedBox(height: 6),
+          TextButton.icon(
+            icon: const Icon(Icons.refresh, size: 16),
+            label: const Text('Retry scan'),
+            onPressed: () => ref.read(devicesProvider.notifier).scan(),
+          ),
+        ],
+      ],
+    );
+  }
+}
+
+// ── Cast Now Button ─────────────────────────────────────────────────────────
+
+class _CastNowButton extends ConsumerWidget {
+  final VideoLoaded videoState;
+  final StreamFormat format;
+  final DlnaDevice device;
+  const _CastNowButton({
+    required this.videoState,
+    required this.format,
+    required this.device,
+  });
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final settings = ref.watch(settingsProvider);
+    final cs = Theme.of(context).colorScheme;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        FilledButton.icon(
+          icon: const Icon(Icons.cast, size: 22),
+          label: Text('Cast to ${device.name}'),
+          style: FilledButton.styleFrom(
+            padding: const EdgeInsets.symmetric(vertical: 16),
+            textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            backgroundColor: cs.primary,
+            foregroundColor: cs.onPrimary,
+          ),
+          onPressed: () {
+            final selectedSub = ref.read(selectedSubtitleProvider);
+            final subs = videoState.info.subtitles;
+            final sub = selectedSub ?? (subs.isNotEmpty ? subs.first : null);
+
+            ref.read(castHistoryProvider.notifier).add(
+              videoState.sourceUrl,
+              videoState.info.title,
+              videoState.info.thumbnailUrl,
+            );
+            ref.read(lastDeviceProvider.notifier).save(device.location);
+
+            ref.read(castProvider.notifier).cast(
+              device: device,
+              format: format,
+              title: videoState.info.title,
+              routeThroughPhone: settings.routeThroughPhone,
+              subtitleSrt: sub?.srtContent,
+              durationSeconds: videoState.info.durationSeconds,
+            );
+          },
+        ),
+        const SizedBox(height: 6),
+        Row(children: [
+          Icon(Icons.tv, size: 12, color: cs.onSurfaceVariant),
+          const SizedBox(width: 4),
+          Text(device.name,
+              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+          const SizedBox(width: 12),
+          Icon(Icons.hd_rounded, size: 12, color: cs.onSurfaceVariant),
+          const SizedBox(width: 4),
+          Expanded(
+            child: Text(format.label,
+                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                overflow: TextOverflow.ellipsis),
+          ),
+        ]),
+      ],
+    );
+  }
+}
+
+// ── Cast Controls ───────────────────────────────────────────────────────────
+
+class _CastControls extends ConsumerStatefulWidget {
+  final VideoState? videoState;
+  const _CastControls({this.videoState});
+
+  @override
+  ConsumerState<_CastControls> createState() => _CastControlsState();
+}
+
+class _CastControlsState extends ConsumerState<_CastControls> {
+  double? _volume;
+  bool _volumeLoading = false;
+  bool _volumeFetched = false;
+
+  Future<void> _fetchVolume(DlnaDevice device) async {
+    if (_volumeLoading || _volumeFetched) return;
+    setState(() => _volumeLoading = true);
+    try {
+      final v = await ref.read(dlnaServiceProvider).getVolume(device);
+      _volumeFetched = true;
+      if (mounted && v != null) setState(() => _volume = v.toDouble());
+    } finally {
+      if (mounted) setState(() => _volumeLoading = false);
+    }
+  }
+
+  Future<void> _setVolume(DlnaDevice device, double v) async {
+    setState(() => _volume = v);
+    await ref.read(dlnaServiceProvider).setVolume(device, v.round());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final castState = ref.watch(castProvider);
+    final progress = ref.watch(castPositionProvider);
+    final cs = Theme.of(context).colorScheme;
+
+    if (castState is CastError) {
+      return Card(
+        elevation: 0,
+        color: cs.errorContainer.withAlpha(60),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _ErrorBanner(castState.message),
+              const SizedBox(height: 10),
+              OutlinedButton(
+                onPressed: () => ref.read(castProvider.notifier).stop(),
+                child: const Text('Dismiss'),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (castState is CastPreparing) {
+      return Card(
+        elevation: 0,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        child: const Padding(
+          padding: EdgeInsets.all(24),
+          child: Column(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 12),
+              Text('Starting stream…'),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (castState is CastPlaying) {
+      if (!_volumeFetched && castState.device.renderingControlUrl != null) {
+        WidgetsBinding.instance.addPostFrameCallback(
+          (_) => _fetchVolume(castState.device),
+        );
+      }
+
+      final total = progress.total.inSeconds;
+      final pos = progress.position.inSeconds.clamp(0, total > 0 ? total : 1);
+
+      return Card(
+        elevation: 2,
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        color: cs.primaryContainer.withAlpha(40),
+        child: Padding(
+          padding: const EdgeInsets.all(16),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Now playing
+              Row(children: [
+                Icon(Icons.cast_connected, color: cs.primary, size: 22),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(castState.title,
+                          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
+                          maxLines: 1, overflow: TextOverflow.ellipsis),
+                      Text('on ${castState.device.name}',
+                          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                    ],
+                  ),
+                ),
+                if (castState.routedThroughPhone)
+                  Tooltip(
+                    message: 'Routing through phone',
+                    child: Icon(Icons.phone_android, size: 16, color: cs.tertiary),
+                  ),
+              ]),
+
+              // Progress
+              if (total > 0) ...[
+                const SizedBox(height: 12),
+                SliderTheme(
+                  data: SliderTheme.of(context).copyWith(trackHeight: 3),
+                  child: Slider(
+                    value: pos.toDouble(),
+                    min: 0,
+                    max: total.toDouble(),
+                    onChanged: (v) {},
+                    onChangeEnd: (v) =>
+                        ref.read(castProvider.notifier).seek(Duration(seconds: v.toInt())),
+                  ),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Text(_fmt(progress.position), style: const TextStyle(fontSize: 11)),
+                      Text(_fmt(progress.total), style: const TextStyle(fontSize: 11)),
+                    ],
+                  ),
+                ),
+              ],
+
+              const SizedBox(height: 12),
+
+              // Controls
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                children: [
+                  IconButton.filled(
+                    icon: Icon(castState.isPaused ? Icons.play_arrow : Icons.pause, size: 28),
+                    iconSize: 28,
+                    onPressed: () => ref.read(castProvider.notifier).pauseResume(),
+                    tooltip: castState.isPaused ? 'Resume' : 'Pause',
+                  ),
+                  FilledButton.tonalIcon(
+                    icon: const Icon(Icons.stop),
+                    label: const Text('Stop'),
+                    onPressed: () {
+                      setState(() {
+                        _volume = null;
+                        _volumeFetched = false;
+                      });
+                      ref.read(castProvider.notifier).stop();
+                    },
+                  ),
+                ],
+              ),
+
+              // Volume
+              if (castState.device.renderingControlUrl != null) ...[
+                const SizedBox(height: 8),
+                Row(
+                  children: [
+                    const Icon(Icons.volume_down, size: 18),
+                    Expanded(
+                      child: Slider(
+                        value: (_volume ?? 50).clamp(0, 100).toDouble(),
+                        min: 0, max: 100, divisions: 20,
+                        label: '${(_volume ?? 50).round()}',
+                        onChanged: (v) => setState(() => _volume = v),
+                        onChangeEnd: (v) => _setVolume(castState.device, v),
+                      ),
+                    ),
+                    const Icon(Icons.volume_up, size: 18),
+                  ],
+                ),
+              ],
+            ],
+          ),
+        ),
+      );
+    }
+
+    return const SizedBox.shrink();
+  }
+
+  String _fmt(Duration d) {
+    final h = d.inHours;
+    final m = (d.inMinutes % 60).toString().padLeft(2, '0');
+    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+}
+
+// ── Cast History ────────────────────────────────────────────────────────────
 
 class _CastHistory extends ConsumerWidget {
   const _CastHistory();
@@ -446,7 +812,6 @@ class _CastHistory extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final history = ref.watch(castHistoryProvider);
     if (history.isEmpty) return const SizedBox.shrink();
-
     final cs = Theme.of(context).colorScheme;
 
     return Column(
@@ -456,11 +821,8 @@ class _CastHistory extends ConsumerWidget {
           children: [
             Icon(Icons.history, size: 18, color: cs.onSurfaceVariant),
             const SizedBox(width: 6),
-            Text('Recently Cast',
-                style: TextStyle(
-                    fontWeight: FontWeight.w600,
-                    fontSize: 14,
-                    color: cs.onSurfaceVariant)),
+            Text('Recently Cast', style: TextStyle(
+              fontWeight: FontWeight.w600, fontSize: 14, color: cs.onSurfaceVariant)),
             const Spacer(),
             TextButton(
               onPressed: () => ref.read(castHistoryProvider.notifier).clear(),
@@ -477,12 +839,9 @@ class _CastHistory extends ConsumerWidget {
                       borderRadius: BorderRadius.circular(4),
                       child: Image.network(
                         item.thumbnailUrl!,
-                        width: 48,
-                        height: 28,
-                        fit: BoxFit.cover,
+                        width: 48, height: 28, fit: BoxFit.cover,
                         errorBuilder: (_, __, ___) => Container(
-                          width: 48,
-                          height: 28,
+                          width: 48, height: 28,
                           color: cs.surfaceContainerHighest,
                           child: const Icon(Icons.video_file, size: 16),
                         ),
@@ -490,8 +849,7 @@ class _CastHistory extends ConsumerWidget {
                     )
                   : Icon(Icons.play_circle_outline, color: cs.primary),
               title: Text(item.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
+                  maxLines: 1, overflow: TextOverflow.ellipsis,
                   style: const TextStyle(fontSize: 13)),
               subtitle: Text(_timeAgo(item.castAt),
                   style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
@@ -519,378 +877,34 @@ class _CastHistory extends ConsumerWidget {
   }
 }
 
-// ── _DeviceList ───────────────────────────────────────────────────────────────
+// ── Error Banner ────────────────────────────────────────────────────────────
 
-class _DeviceList extends ConsumerWidget {
-  const _DeviceList();
-
-  @override
-  Widget build(BuildContext context, WidgetRef ref) {
-    final devicesState = ref.watch(devicesProvider);
-    final selectedDevice = ref.watch(selectedDeviceProvider);
-    final lastDeviceLocation = ref.watch(lastDeviceProvider);
-
-    // Auto-select last used device when scan completes
-    if (devicesState is DevicesResult &&
-        selectedDevice == null &&
-        lastDeviceLocation != null) {
-      final match = devicesState.devices
-          .where((d) => d.location == lastDeviceLocation)
-          .firstOrNull;
-      if (match != null) {
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          ref.read(selectedDeviceProvider.notifier).state = match;
-        });
-      }
-    }
-
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        Row(children: [
-          Expanded(
-            child: FilledButton.icon(
-              icon: devicesState is DevicesScanning
-                  ? const SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(strokeWidth: 2, color: Colors.white),
-                    )
-                  : const Icon(Icons.search),
-              label: Text(devicesState is DevicesScanning ? 'Scanning…' : 'Scan for TVs'),
-              onPressed: devicesState is DevicesScanning
-                  ? null
-                  : () => ref.read(devicesProvider.notifier).scan(),
-            ),
-          ),
-        ]),
-
-        if (devicesState is DevicesResult) ...[
-          const SizedBox(height: 10),
-          if (devicesState.devices.isEmpty)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 8),
-              child: Text(
-                'No DLNA/UPnP devices found.\nMake sure your TV is on and on the same WiFi network.',
-                style: TextStyle(color: Theme.of(context).colorScheme.onSurfaceVariant, fontSize: 13),
-              ),
-            )
-          else
-            ...devicesState.devices.map((d) => _DeviceTile(
-                  device: d,
-                  isSelected: selectedDevice == d,
-                  onTap: () => ref.read(selectedDeviceProvider.notifier).state = d,
-                )),
-        ],
-
-        if (devicesState is DevicesError) ...[
-          const SizedBox(height: 8),
-          _ErrorBanner(devicesState.message),
-          const SizedBox(height: 6),
-          TextButton.icon(
-            icon: const Icon(Icons.refresh, size: 16),
-            label: const Text('Retry scan'),
-            onPressed: () => ref.read(devicesProvider.notifier).scan(),
-          ),
-        ],
-      ],
-    );
-  }
-}
-
-class _DeviceTile extends StatelessWidget {
-  final DlnaDevice device;
-  final bool isSelected;
-  final VoidCallback onTap;
-
-  const _DeviceTile({
-    required this.device,
-    required this.isSelected,
-    required this.onTap,
-  });
+class _ErrorBanner extends StatelessWidget {
+  final String message;
+  const _ErrorBanner(this.message);
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 6),
-      child: ListTile(
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(10),
-          side: BorderSide(
-            color: isSelected ? cs.primary : cs.outlineVariant,
-            width: isSelected ? 2 : 1,
-          ),
-        ),
-        tileColor: isSelected ? cs.primaryContainer.withAlpha(80) : null,
-        leading: Icon(Icons.tv, color: isSelected ? cs.primary : cs.onSurfaceVariant),
-        title: Text(device.name,
-            style: TextStyle(
-                fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal, fontSize: 14)),
-        subtitle: device.manufacturer.isNotEmpty
-            ? Text(device.manufacturer, style: const TextStyle(fontSize: 12))
-            : null,
-        trailing: isSelected ? Icon(Icons.check_circle, color: cs.primary) : null,
-        onTap: onTap,
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: cs.errorContainer,
+        borderRadius: BorderRadius.circular(8),
       ),
+      child: Row(children: [
+        Icon(Icons.error_outline, size: 18, color: cs.onErrorContainer),
+        const SizedBox(width: 8),
+        Expanded(
+          child: Text(message,
+              style: TextStyle(color: cs.onErrorContainer, fontSize: 13)),
+        ),
+      ]),
     );
   }
 }
 
-// ── _CastControls ─────────────────────────────────────────────────────────────
-
-class _CastControls extends ConsumerStatefulWidget {
-  const _CastControls();
-
-  @override
-  ConsumerState<_CastControls> createState() => _CastControlsState();
-}
-
-class _CastControlsState extends ConsumerState<_CastControls> {
-  // Volume is kept as local UI state; 0–100, null = not yet known.
-  double? _volume;
-  bool _volumeLoading = false;
-  bool _volumeFetched = false; // prevent infinite retry when TV returns null
-
-  Future<void> _fetchVolume(DlnaDevice device) async {
-    if (_volumeLoading || _volumeFetched) return;
-    setState(() => _volumeLoading = true);
-    try {
-      final v = await ref.read(dlnaServiceProvider).getVolume(device);
-      _volumeFetched = true;
-      if (mounted && v != null) setState(() => _volume = v.toDouble());
-    } finally {
-      if (mounted) setState(() => _volumeLoading = false);
-    }
-  }
-
-  Future<void> _setVolume(DlnaDevice device, double v) async {
-    setState(() => _volume = v);
-    await ref.read(dlnaServiceProvider).setVolume(device, v.round());
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final castState = ref.watch(castProvider);
-    final progress = ref.watch(castPositionProvider);
-    final videoState = ref.watch(videoProvider);
-    final selectedDevice = ref.watch(selectedDeviceProvider);
-    final selectedFormat = ref.watch(selectedFormatProvider);
-    final settings = ref.watch(settingsProvider);
-    final cs = Theme.of(context).colorScheme;
-
-    if (castState is CastError) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _ErrorBanner(castState.message),
-          const SizedBox(height: 10),
-          OutlinedButton(
-            onPressed: () => ref.read(castProvider.notifier).stop(),
-            child: const Text('Dismiss'),
-          ),
-        ],
-      );
-    }
-
-    if (castState is CastPreparing) {
-      return const Center(
-        child: Padding(
-          padding: EdgeInsets.all(24),
-          child: Column(
-            children: [
-              CircularProgressIndicator(),
-              SizedBox(height: 12),
-              Text('Starting stream…'),
-            ],
-          ),
-        ),
-      );
-    }
-
-    if (castState is CastPlaying) {
-      // Fetch current volume from TV once when we first see a device.
-      if (!_volumeFetched && castState.device.renderingControlUrl != null) {
-        WidgetsBinding.instance.addPostFrameCallback(
-          (_) => _fetchVolume(castState.device),
-        );
-      }
-
-      final total = progress.total.inSeconds;
-      final pos = progress.position.inSeconds.clamp(0, total > 0 ? total : 1);
-
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // Now playing info
-          Row(children: [
-            Icon(Icons.cast_connected, color: cs.primary, size: 20),
-            const SizedBox(width: 8),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(castState.title,
-                      style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis),
-                  Text(castState.device.name,
-                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
-                ],
-              ),
-            ),
-            if (castState.routedThroughPhone)
-              Tooltip(
-                message: 'Routing through phone',
-                child: Icon(Icons.phone_android, size: 16, color: cs.tertiary),
-              ),
-          ]),
-
-          // Progress bar
-          if (total > 0) ...[
-            const SizedBox(height: 12),
-            SliderTheme(
-              data: SliderTheme.of(context).copyWith(trackHeight: 3),
-              child: Slider(
-                value: pos.toDouble(),
-                min: 0,
-                max: total.toDouble(),
-                onChanged: (v) {}, // visual only while dragging
-                onChangeEnd: (v) =>
-                    ref.read(castProvider.notifier).seek(Duration(seconds: v.toInt())),
-              ),
-            ),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 4),
-              child: Row(
-                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                children: [
-                  Text(_fmt(progress.position), style: const TextStyle(fontSize: 11)),
-                  Text(_fmt(progress.total), style: const TextStyle(fontSize: 11)),
-                ],
-              ),
-            ),
-          ],
-
-          const SizedBox(height: 12),
-
-          // Controls row
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-            children: [
-              IconButton.filled(
-                icon: Icon(castState.isPaused ? Icons.play_arrow : Icons.pause),
-                onPressed: () => ref.read(castProvider.notifier).pauseResume(),
-                tooltip: castState.isPaused ? 'Resume' : 'Pause',
-              ),
-              FilledButton.tonalIcon(
-                icon: const Icon(Icons.stop),
-                label: const Text('Stop'),
-                onPressed: () {
-                  setState(() {
-                    _volume = null;
-                    _volumeFetched = false;
-                  });
-                  ref.read(castProvider.notifier).stop();
-                },
-              ),
-            ],
-          ),
-
-          // Volume row — only shown when the TV supports RenderingControl.
-          if (castState.device.renderingControlUrl != null) ...[  
-            const SizedBox(height: 8),
-            Row(
-              children: [
-                const Icon(Icons.volume_down, size: 18),
-                Expanded(
-                  child: Slider(
-                    value: (_volume ?? 50).clamp(0, 100).toDouble(),
-                    min: 0,
-                    max: 100,
-                    divisions: 20,
-                    label: '${(_volume ?? 50).round()}',
-                    onChanged: (v) => setState(() => _volume = v),
-                    onChangeEnd: (v) => _setVolume(castState.device, v),
-                  ),
-                ),
-                const Icon(Icons.volume_up, size: 18),
-              ],
-            ),
-          ],
-        ],
-      );
-    }
-
-    // Idle but step 4 visible means ready to cast
-    if (selectedDevice != null && selectedFormat != null && videoState is VideoLoaded) {
-      return Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          FilledButton.icon(
-            icon: const Icon(Icons.cast),
-            label: const Text('Cast to TV'),
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(vertical: 14),
-              textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
-            ),
-            onPressed: () {
-                  // Use selected subtitle (from picker) or first available
-                  final selectedSub = ref.read(selectedSubtitleProvider);
-                  final subs = videoState.info.subtitles;
-                  final sub = selectedSub ?? (subs.isNotEmpty ? subs.first : null);
-
-                  // Record to history
-                  ref.read(castHistoryProvider.notifier).add(
-                        videoState.sourceUrl,
-                        videoState.info.title,
-                        videoState.info.thumbnailUrl,
-                      );
-
-                  // Remember this device
-                  ref.read(lastDeviceProvider.notifier).save(selectedDevice.location);
-
-                  ref.read(castProvider.notifier).cast(
-                    device: selectedDevice,
-                    format: selectedFormat,
-                    title: videoState.info.title,
-                    routeThroughPhone: settings.routeThroughPhone,
-                    subtitleSrt: sub?.srtContent,
-                    durationSeconds: videoState.info.durationSeconds,
-                  );
-                },
-          ),
-          const SizedBox(height: 8),
-          Row(children: [
-            Icon(Icons.tv, size: 14, color: cs.onSurfaceVariant),
-            const SizedBox(width: 4),
-            Text(selectedDevice.name,
-                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
-            const SizedBox(width: 12),
-            Icon(Icons.hd_rounded, size: 14, color: cs.onSurfaceVariant),
-            const SizedBox(width: 4),
-            Expanded(
-              child: Text(selectedFormat.label,
-                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                  overflow: TextOverflow.ellipsis),
-            ),
-          ]),
-        ],
-      );
-    }
-
-    return const SizedBox.shrink();
-  }
-
-  String _fmt(Duration d) {
-    final h = d.inHours;
-    final m = (d.inMinutes % 60).toString().padLeft(2, '0');
-    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
-    return h > 0 ? '$h:$m:$s' : '$m:$s';
-  }
-}
-
-// ── _RouteToggleBar ───────────────────────────────────────────────────────────
+// ── Route Toggle Bar ────────────────────────────────────────────────────────
 
 class _RouteToggleBar extends ConsumerWidget {
   const _RouteToggleBar();
@@ -912,25 +926,18 @@ class _RouteToggleBar extends ConsumerWidget {
         ),
         child: Row(
           children: [
-            Icon(
-              Icons.phone_android,
-              size: 20,
-              color: active ? cs.secondary : cs.onSurfaceVariant,
-            ),
+            Icon(Icons.phone_android, size: 20,
+                color: active ? cs.secondary : cs.onSurfaceVariant),
             const SizedBox(width: 10),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text(
-                    'Route through phone',
-                    style: TextStyle(
-                      fontWeight: FontWeight.w600,
-                      fontSize: 13,
-                      color: active ? cs.onSecondaryContainer : cs.onSurface,
-                    ),
-                  ),
+                  Text('Route through phone', style: TextStyle(
+                    fontWeight: FontWeight.w600, fontSize: 13,
+                    color: active ? cs.onSecondaryContainer : cs.onSurface,
+                  )),
                   Text(
                     active
                         ? 'Phone proxies the stream to your TV'
@@ -951,7 +958,7 @@ class _RouteToggleBar extends ConsumerWidget {
   }
 }
 
-// ── _SettingsSheet ────────────────────────────────────────────────────────────
+// ── Settings Sheet ──────────────────────────────────────────────────────────
 
 class _SettingsSheet extends ConsumerWidget {
   const _SettingsSheet();
@@ -959,7 +966,6 @@ class _SettingsSheet extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final settings = ref.watch(settingsProvider);
-
     return Padding(
       padding: EdgeInsets.fromLTRB(
           20, 20, 20, MediaQuery.of(context).viewInsets.bottom + 20),
@@ -969,7 +975,6 @@ class _SettingsSheet extends ConsumerWidget {
         children: [
           Text('Settings', style: Theme.of(context).textTheme.titleLarge),
           const SizedBox(height: 16),
-
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
             title: const Text('Route through phone'),
@@ -980,31 +985,20 @@ class _SettingsSheet extends ConsumerWidget {
             value: settings.routeThroughPhone,
             onChanged: (_) => ref.read(settingsProvider.notifier).toggle(),
           ),
-
           const Divider(),
-
-          const _SupportedSitesTile(),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.info_outline),
+            title: const Text('Supported sources'),
+            subtitle: const Text(
+              'YouTube (full quality picker)\n'
+              'Direct video URLs (.mp4, .m3u8, .webm, .mkv)\n'
+              'Any DLNA/UPnP-compatible TV or renderer',
+            ),
+            isThreeLine: true,
+          ),
         ],
       ),
-    );
-  }
-}
-
-class _SupportedSitesTile extends StatelessWidget {
-  const _SupportedSitesTile();
-
-  @override
-  Widget build(BuildContext context) {
-    return ListTile(
-      contentPadding: EdgeInsets.zero,
-      leading: const Icon(Icons.info_outline),
-      title: const Text('Supported sources'),
-      subtitle: const Text(
-        'YouTube (full quality picker)\n'
-        'Direct video URLs (.mp4, .m3u8, .webm, .mkv)\n'
-        'Any DLNA/UPnP-compatible TV or renderer',
-      ),
-      isThreeLine: true,
     );
   }
 }

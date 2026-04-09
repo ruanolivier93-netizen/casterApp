@@ -26,6 +26,37 @@ const _bookmarks = [
   _Bookmark('Twitter/X', 'https://x.com', Icons.alternate_email),
 ];
 
+// ── Detected Video ──────────────────────────────────────────────────────────
+
+class _DetectedVideo {
+  final String url;
+  final String type; // 'video', 'source', 'xhr', 'fetch', 'resource', 'embed', 'link', 'meta', etc.
+  const _DetectedVideo({required this.url, required this.type});
+
+  /// Priority — lower is better. Direct streams > meta > embeds > links.
+  int get priority {
+    switch (type) {
+      case 'video':
+      case 'source':
+        return 0;
+      case 'xhr':
+      case 'fetch':
+      case 'resource':
+        return 1;
+      case 'meta':
+      case 'json-ld':
+      case 'data-attr':
+        return 2;
+      case 'embed':
+        return 3;
+      case 'link':
+        return 4;
+      default:
+        return 5;
+    }
+  }
+}
+
 // ── Browser Screen ──────────────────────────────────────────────────────────
 
 class BrowserScreen extends StatefulWidget {
@@ -47,7 +78,6 @@ class _BrowserScreenState extends State<BrowserScreen>
   bool _canGoBack = false;
   bool _canGoForward = false;
 
-  /// Videos detected on the current page via JS injection.
   final List<_DetectedVideo> _detectedVideos = [];
   bool _showBookmarks = true;
 
@@ -77,7 +107,7 @@ class _BrowserScreenState extends State<BrowserScreen>
             });
             _urlController.text = url;
           }
-          // Inject CSS ad-blocker early
+          // Inject CSS ad-blocker + network interceptor EARLY.
           _controller.runJavaScript('''
             (function(){
               var s = document.createElement('style');
@@ -85,6 +115,7 @@ class _BrowserScreenState extends State<BrowserScreen>
               (document.head || document.documentElement).appendChild(s);
             })();
           ''');
+          _controller.runJavaScript(AdBlocker.videoDetectorScript);
         },
         onProgress: (p) {
           if (mounted) setState(() => _progress = p / 100);
@@ -99,7 +130,6 @@ class _BrowserScreenState extends State<BrowserScreen>
             _canGoBack = back;
             _canGoForward = fwd;
           });
-          // Inject ad blocker JS + video detection JS
           _controller.runJavaScript(AdBlocker.jsScript);
           _controller.runJavaScript(AdBlocker.videoDetectorScript);
         },
@@ -108,7 +138,6 @@ class _BrowserScreenState extends State<BrowserScreen>
     _urlController.text = 'https://www.google.com';
   }
 
-  /// Called from the VideoDetector JavaScriptChannel.
   void _onVideoDetected(JavaScriptMessage msg) {
     try {
       final data = jsonDecode(msg.message) as Map<String, dynamic>;
@@ -116,7 +145,6 @@ class _BrowserScreenState extends State<BrowserScreen>
       final type = data['type'] as String? ?? '';
       if (url.isEmpty) return;
       if (_detectedVideos.any((v) => v.url == url)) return;
-
       if (mounted) {
         setState(() {
           _detectedVideos.add(_DetectedVideo(url: url, type: type));
@@ -135,13 +163,11 @@ class _BrowserScreenState extends State<BrowserScreen>
   void _navigateTo(String input) {
     var url = input.trim();
     if (url.isEmpty) return;
-
     if (!url.contains('.') || url.contains(' ')) {
       url = 'https://www.google.com/search?q=${Uri.encodeComponent(url)}';
     } else if (!url.startsWith('http://') && !url.startsWith('https://')) {
       url = 'https://$url';
     }
-
     _controller.loadRequest(Uri.parse(url));
     _urlFocus.unfocus();
   }
@@ -155,104 +181,251 @@ class _BrowserScreenState extends State<BrowserScreen>
     return "'$escaped'";
   }
 
-  bool _isVideoUrl(String url) {
-    final lower = url.toLowerCase();
+  bool _isPlatformUrl(String url) {
     final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
     return host.contains('youtube.com') ||
         host.contains('youtu.be') ||
-        lower.contains('.mp4') ||
-        lower.contains('.m3u8') ||
-        lower.contains('.webm') ||
-        lower.contains('.mkv');
+        host.contains('m.youtube.com');
+  }
+
+  String _normalizeForCast(String url) {
+    if (url.contains('youtube.com/embed/')) {
+      final uri = Uri.tryParse(url);
+      if (uri != null) {
+        final parts = uri.pathSegments;
+        final idx = parts.indexOf('embed');
+        if (idx >= 0 && idx + 1 < parts.length) {
+          return 'https://www.youtube.com/watch?v=${parts[idx + 1]}';
+        }
+      }
+    }
+    if (url.contains('youtube.com/shorts/')) {
+      final uri = Uri.tryParse(url);
+      if (uri != null && uri.pathSegments.length >= 2) {
+        return 'https://www.youtube.com/watch?v=${uri.pathSegments[1]}';
+      }
+    }
+    if (url.contains('player.vimeo.com/video/')) {
+      final uri = Uri.tryParse(url);
+      if (uri != null && uri.pathSegments.length >= 2) {
+        return 'https://vimeo.com/${uri.pathSegments.last}';
+      }
+    }
+    if (url.contains('dailymotion.com/embed/video/')) {
+      final uri = Uri.tryParse(url);
+      if (uri != null && uri.pathSegments.isNotEmpty) {
+        return 'https://www.dailymotion.com/video/${uri.pathSegments.last}';
+      }
+    }
+    return url;
   }
 
   String _videoLabel(String url) {
     final uri = Uri.tryParse(url);
     if (uri == null) return url;
-
-    if (url.contains('youtube.com/embed/')) {
-      final parts = uri.pathSegments;
-      final idx = parts.indexOf('embed');
-      if (idx >= 0 && idx + 1 < parts.length) return 'YouTube embed: ${parts[idx + 1]}';
-    }
-    if (url.contains('player.vimeo.com')) return 'Vimeo player';
-    if (url.contains('dailymotion.com/embed')) return 'Dailymotion embed';
-
-    final last =
-        uri.pathSegments.isNotEmpty ? Uri.decodeComponent(uri.pathSegments.last) : '';
+    final host = uri.host.toLowerCase();
+    if (host.contains('youtube.com') || host.contains('youtu.be')) return 'YouTube video';
+    if (host.contains('vimeo.com')) return 'Vimeo video';
+    if (host.contains('dailymotion.com') || host.contains('dai.ly')) return 'Dailymotion video';
+    if (host.contains('twitch.tv')) return 'Twitch stream';
+    if (host.contains('facebook.com')) return 'Facebook video';
+    final last = uri.pathSegments.isNotEmpty
+        ? Uri.decodeComponent(uri.pathSegments.last.split('?').first)
+        : '';
     if (last.length > 4) return last.length > 50 ? '${last.substring(0, 50)}…' : last;
-    return uri.host;
+    return host.isNotEmpty ? host : url;
   }
 
-  void _showDetectedVideos() {
+  String _typeLabel(String type) {
+    switch (type) {
+      case 'video':
+      case 'source':
+        return 'Direct stream';
+      case 'xhr':
+      case 'fetch':
+        return 'Network stream';
+      case 'resource':
+        return 'Resource';
+      case 'embed':
+        return 'Embedded player';
+      case 'link':
+        return 'Video link';
+      case 'meta':
+      case 'json-ld':
+        return 'Page metadata';
+      case 'data-attr':
+        return 'Data attribute';
+      default:
+        return type;
+    }
+  }
+
+  IconData _typeIcon(String type) {
+    switch (type) {
+      case 'video':
+      case 'source':
+        return Icons.play_circle;
+      case 'xhr':
+      case 'fetch':
+      case 'resource':
+        return Icons.cloud_download;
+      case 'embed':
+        return Icons.ondemand_video;
+      case 'link':
+        return Icons.link;
+      default:
+        return Icons.videocam;
+    }
+  }
+
+  void _castBest() {
+    if (_detectedVideos.isNotEmpty) {
+      final sorted = List<_DetectedVideo>.from(_detectedVideos)
+        ..sort((a, b) => a.priority.compareTo(b.priority));
+      widget.onCastUrl(_normalizeForCast(sorted.first.url));
+    } else if (_isPlatformUrl(_currentUrl)) {
+      widget.onCastUrl(_normalizeForCast(_currentUrl));
+    }
+  }
+
+  void _showVideoPicker() {
     final cs = Theme.of(context).colorScheme;
+
+    // Sort: direct streams first, embeds last
+    final sorted = List<_DetectedVideo>.from(_detectedVideos)
+      ..sort((a, b) => a.priority.compareTo(b.priority));
+
+    // Also add current page URL if it's a platform URL and not already in list
+    final items = <_DetectedVideo>[...sorted];
+    if (_isPlatformUrl(_currentUrl) &&
+        !items.any((v) => _normalizeForCast(v.url) == _normalizeForCast(_currentUrl))) {
+      items.insert(0, _DetectedVideo(url: _currentUrl, type: 'page'));
+    }
+
     showModalBottomSheet(
       context: context,
+      isScrollControlled: true,
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      builder: (ctx) => Padding(
-        padding: const EdgeInsets.fromLTRB(16, 16, 16, 24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              Icon(Icons.video_library, color: cs.primary),
-              const SizedBox(width: 8),
-              Text(
-                '${_detectedVideos.length} video${_detectedVideos.length == 1 ? '' : 's'} found',
-                style: Theme.of(ctx).textTheme.titleMedium,
+      builder: (ctx) => DraggableScrollableSheet(
+        initialChildSize: 0.45,
+        minChildSize: 0.3,
+        maxChildSize: 0.85,
+        expand: false,
+        builder: (_, scrollController) => Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // Drag handle
+              Center(
+                child: Container(
+                  width: 40, height: 4,
+                  margin: const EdgeInsets.only(bottom: 12),
+                  decoration: BoxDecoration(
+                    color: cs.onSurfaceVariant.withAlpha(80),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
               ),
-            ]),
-            const SizedBox(height: 12),
-            ..._detectedVideos.map((v) => ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  leading: Icon(
-                    v.type == 'embed' ? Icons.ondemand_video : Icons.videocam,
-                    color: cs.primary,
-                  ),
-                  title: Text(_videoLabel(v.url),
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 14)),
-                  subtitle: Text(v.type,
-                      style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-                  trailing: FilledButton.icon(
-                    icon: const Icon(Icons.cast, size: 16),
-                    label: const Text('Cast'),
-                    style: FilledButton.styleFrom(
-                      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                      textStyle: const TextStyle(fontSize: 12),
-                    ),
-                    onPressed: () {
-                      Navigator.pop(ctx);
-                      var castUrl = v.url;
-                      if (castUrl.contains('youtube.com/embed/')) {
-                        final id = Uri.parse(castUrl).pathSegments.last;
-                        castUrl = 'https://www.youtube.com/watch?v=$id';
-                      }
-                      widget.onCastUrl(castUrl);
-                    },
-                  ),
-                )),
-          ],
+              Row(children: [
+                Icon(Icons.cast, color: cs.primary, size: 22),
+                const SizedBox(width: 8),
+                Text(
+                  'Cast a video',
+                  style: Theme.of(ctx).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+                ),
+                const Spacer(),
+                Text(
+                  '${items.length} found',
+                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                ),
+              ]),
+              const SizedBox(height: 4),
+              Text(
+                'Tap a video to send it to the Cast tab for TV selection.',
+                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+              ),
+              const SizedBox(height: 12),
+              Expanded(
+                child: ListView.separated(
+                  controller: scrollController,
+                  itemCount: items.length,
+                  separatorBuilder: (_, __) => const Divider(height: 1),
+                  itemBuilder: (_, i) {
+                    final v = items[i];
+                    final label = v.type == 'page' ? 'This page' : _videoLabel(v.url);
+                    final typeText = v.type == 'page' ? 'YouTube page' : _typeLabel(v.type);
+                    return ListTile(
+                      contentPadding: const EdgeInsets.symmetric(vertical: 4),
+                      leading: CircleAvatar(
+                        backgroundColor: cs.primaryContainer,
+                        child: Icon(_typeIcon(v.type), color: cs.primary, size: 20),
+                      ),
+                      title: Text(label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
+                      subtitle: Text(typeText,
+                          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                      trailing: FilledButton.icon(
+                        icon: const Icon(Icons.cast, size: 16),
+                        label: const Text('Cast'),
+                        style: FilledButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                          textStyle: const TextStyle(fontSize: 12),
+                        ),
+                        onPressed: () {
+                          Navigator.pop(ctx);
+                          widget.onCastUrl(_normalizeForCast(v.url));
+                        },
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
   }
 
+  int get _castableCount {
+    int count = _detectedVideos.length;
+    if (_isPlatformUrl(_currentUrl)) count = count > 0 ? count : 1;
+    return count;
+  }
+
+  // ── Build ─────────────────────────────────────────────────────────────────
+
   @override
   Widget build(BuildContext context) {
     super.build(context);
     final cs = Theme.of(context).colorScheme;
-    final videoDetected = _isVideoUrl(_currentUrl) || _detectedVideos.isNotEmpty;
+    final hasCastable = _castableCount > 0;
 
     return Scaffold(
       appBar: AppBar(
         titleSpacing: 0,
         title: _buildUrlBar(cs),
         actions: [
+          // ── Cast button — the star of the show ──
+          if (hasCastable)
+            _AnimatedCastButton(
+              count: _castableCount,
+              onTap: _castableCount == 1 && _detectedVideos.isEmpty
+                  ? _castBest // single platform page → cast directly
+                  : _showVideoPicker,
+            ),
+          if (!hasCastable)
+            IconButton(
+              icon: const Icon(Icons.cast_outlined, size: 22),
+              tooltip: 'No videos detected',
+              onPressed: null, // disabled look
+            ),
           IconButton(
             icon: const Icon(Icons.refresh, size: 20),
             tooltip: 'Reload',
@@ -270,13 +443,6 @@ class _BrowserScreenState extends State<BrowserScreen>
         children: [
           if (_showBookmarks) _buildBookmarksGrid(cs),
           Expanded(child: WebViewWidget(controller: _controller)),
-          _CastBar(
-            url: _currentUrl,
-            videoDetected: videoDetected,
-            detectedCount: _detectedVideos.length,
-            onCast: () => widget.onCastUrl(_currentUrl),
-            onShowDetected: _detectedVideos.isNotEmpty ? _showDetectedVideos : null,
-          ),
         ],
       ),
       bottomNavigationBar: _buildNavRow(cs),
@@ -361,91 +527,56 @@ class _BrowserScreenState extends State<BrowserScreen>
   }
 }
 
-// ── Detected Video Model ────────────────────────────────────────────────────
+// ── Animated Cast Button (pulses when videos found) ─────────────────────────
 
-class _DetectedVideo {
-  final String url;
-  final String type;
-  const _DetectedVideo({required this.url, required this.type});
+class _AnimatedCastButton extends StatefulWidget {
+  final int count;
+  final VoidCallback onTap;
+  const _AnimatedCastButton({required this.count, required this.onTap});
+
+  @override
+  State<_AnimatedCastButton> createState() => _AnimatedCastButtonState();
 }
 
-// ── Cast Bar ────────────────────────────────────────────────────────────────
+class _AnimatedCastButtonState extends State<_AnimatedCastButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pulse;
+  late final Animation<double> _scale;
 
-class _CastBar extends StatelessWidget {
-  final String url;
-  final bool videoDetected;
-  final int detectedCount;
-  final VoidCallback onCast;
-  final VoidCallback? onShowDetected;
+  @override
+  void initState() {
+    super.initState();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 800),
+    )..repeat(reverse: true);
+    _scale = Tween(begin: 1.0, end: 1.15).animate(
+      CurvedAnimation(parent: _pulse, curve: Curves.easeInOut),
+    );
+  }
 
-  const _CastBar({
-    required this.url,
-    required this.videoDetected,
-    required this.detectedCount,
-    required this.onCast,
-    this.onShowDetected,
-  });
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
 
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
-
-    return AnimatedContainer(
-      duration: const Duration(milliseconds: 250),
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-      decoration: BoxDecoration(
-        color: videoDetected
-            ? cs.primaryContainer.withAlpha(200)
-            : cs.surfaceContainerHighest.withAlpha(120),
-        border: Border(top: BorderSide(color: cs.outlineVariant)),
-      ),
-      child: Row(
-        children: [
-          Icon(
-            videoDetected ? Icons.cast : Icons.cast_outlined,
-            size: 20,
-            color: videoDetected ? cs.primary : cs.onSurfaceVariant,
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 2),
+      child: ScaleTransition(
+        scale: _scale,
+        child: Badge.count(
+          count: widget.count,
+          backgroundColor: cs.error,
+          child: IconButton(
+            icon: Icon(Icons.cast, color: cs.primary, size: 24),
+            tooltip: '${widget.count} video${widget.count == 1 ? '' : 's'} — tap to cast',
+            onPressed: widget.onTap,
           ),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Text(
-              detectedCount > 0
-                  ? '$detectedCount video${detectedCount == 1 ? '' : 's'} found on page'
-                  : videoDetected
-                      ? 'Video page — ready to cast'
-                      : 'Browse to a video page to cast it',
-              style: TextStyle(
-                fontSize: 12,
-                color: videoDetected ? cs.onPrimaryContainer : cs.onSurfaceVariant,
-              ),
-            ),
-          ),
-          if (detectedCount > 0)
-            Padding(
-              padding: const EdgeInsets.only(right: 6),
-              child: OutlinedButton.icon(
-                icon: Badge.count(
-                  count: detectedCount,
-                  child: const Icon(Icons.video_library, size: 16),
-                ),
-                label: const Text('Pick'),
-                style: OutlinedButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
-                  textStyle: const TextStyle(fontSize: 12),
-                ),
-                onPressed: onShowDetected,
-              ),
-            ),
-          FilledButton.icon(
-            icon: const Icon(Icons.cast, size: 16),
-            label: const Text('Cast'),
-            style: FilledButton.styleFrom(
-              padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-              textStyle: const TextStyle(fontSize: 13),
-            ),
-            onPressed: url.isNotEmpty ? onCast : null,
-          ),
-        ],
+        ),
       ),
     );
   }

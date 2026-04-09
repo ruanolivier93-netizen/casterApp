@@ -5,8 +5,9 @@
 ///   2. **CSS injection** — hides common ad containers via element hiding rules
 ///   3. **JS injection**  — strips ad iframes, overlays, popups, and sticky banners
 ///
-/// Also includes a video-detection script that finds `<video>` and `<source>`
-/// elements and reports their URLs to Flutter via a JavaScriptChannel.
+/// Also includes a video-detection script that intercepts network requests
+/// (XMLHttpRequest, fetch) and scans DOM elements to find video URLs,
+/// reporting them to Flutter via a JavaScriptChannel.
 library;
 
 class AdBlocker {
@@ -15,12 +16,74 @@ class AdBlocker {
   // ── Layer 1: Domain-level blocking ──────────────────────────────────────
 
   /// Returns `true` if the URL should be **blocked**.
+  ///
+  /// Video/media content is always allowed through so that players can load.
   static bool shouldBlock(String url) {
     final uri = Uri.tryParse(url);
     if (uri == null) return false;
+
+    // Never block actual video/media resources regardless of domain.
+    final path = uri.path.toLowerCase();
+    if (_videoExtensions.any((ext) => path.endsWith(ext))) return false;
+    if (path.endsWith('.m3u8') || path.endsWith('.mpd')) return false;
+
     final host = uri.host.toLowerCase();
+
+    // Whitelist video CDNs and streaming platforms.
+    if (_videoDomains.any((d) => host == d || host.endsWith('.$d'))) {
+      return false;
+    }
+
     return _blockedDomains.any((d) => host == d || host.endsWith('.$d'));
   }
+
+  /// File extensions that indicate actual video/media content.
+  static const _videoExtensions = [
+    '.mp4', '.m4v', '.webm', '.mkv', '.avi', '.mov', '.flv', '.ts',
+    '.3gp', '.wmv', '.ogv', '.m3u8', '.mpd',
+  ];
+
+  /// Domains that serve legitimate video content — never block these.
+  static const _videoDomains = <String>[
+    // Video platforms & CDNs
+    'googlevideo.com',
+    'ytimg.com',
+    'youtube.com',
+    'youtu.be',
+    'vimeocdn.com',
+    'player.vimeo.com',
+    'akamaihd.net',
+    'akamaized.net',
+    'cloudfront.net',
+    'fastly.net',
+    'cdn77.org',
+    'jwpcdn.com',
+    'jwplatform.com',
+    'brightcovecdn.com',
+    'brightcove.com',
+    'vidible.tv',
+    'dailymotion.com',
+    'dmcdn.net',
+    'twitch.tv',
+    'ttvnw.net',
+    'jtvnw.net',
+    'streamable.com',
+    'bitmovin.com',
+    'cdn.flowplayer.com',
+    'mux.com',
+    'stream.mux.com',
+    'cloudflarestream.com',
+    'videodelivery.net',
+    'fbcdn.net',
+    'fbvideo.com',
+    'cdninstagram.com',
+    'pstatp.com',
+    'tiktokcdn.com',
+    'muscdn.com',
+    'media.tumblr.com',
+    'redditvideo.com',
+    'redditmedia.com',
+  ];
 
   /// Major ad / tracking / analytics domains (covers ≈95 % of web ads).
   static const _blockedDomains = <String>[
@@ -35,10 +98,8 @@ class AdBlocker {
     'adservice.google.com',
     'tpc.googlesyndication.com',
 
-    // Facebook / Meta
+    // Facebook / Meta tracking (NOT facebook.com/fbcdn.net — users watch videos there)
     'facebook.net',
-    'facebook.com', // tracking pixel domain
-    'fbcdn.net',
 
     // Amazon ads
     'amazon-adsystem.com',
@@ -127,8 +188,28 @@ class AdBlocker {
 
     // Malvertising / sketchy
     'adf.ly',
-    'bit.ly', // often used for ad redirects
     'shorte.st',
+
+    // Cookie / consent walls (usually just tracking)
+    'cookielaw.org',
+    'cookiepro.com',
+    'trustarc.com',
+    'consensu.org',
+
+    // Specific Facebook ad/tracking subdomains
+    'an.facebook.com',
+    'pixel.facebook.com',
+
+    // More ad / popup networks
+    'adcolony.com',
+    'startappservice.com',
+    'supersonic.com',
+    'tapjoy.com',
+    'flurry.com',
+    'adjust.com',
+    'branch.io',
+    'kochava.com',
+    'appsflyer.com',
   ];
 
   // ── Layer 2: CSS element-hiding injection ───────────────────────────────
@@ -170,13 +251,55 @@ iframe[src*="amazon-adsystem"],
 ins.adsbygoogle,
 amp-ad,
 amp-embed,
-amp-sticky-ad {
+amp-sticky-ad,
+/* Cookie consent / GDPR banners */
+[id*="cookie-banner"      i],
+[id*="cookie_banner"      i],
+[id*="cookie-consent"     i],
+[id*="cookie_consent"     i],
+[id*="gdpr"               i],
+[id*="consent-banner"     i],
+[class*="cookie-banner"   i],
+[class*="cookie_banner"   i],
+[class*="cookie-consent"  i],
+[class*="cookie_consent"  i],
+[class*="gdpr"            i],
+[class*="consent-banner"  i],
+[class*="CookieConsent"   i],
+[class*="cc-window"       i],
+[class*="cc-banner"       i],
+/* Newsletter / subscribe popups */
+[class*="newsletter-popup" i],
+[class*="subscribe-modal"  i],
+[id*="newsletter-popup"    i],
+[id*="subscribe-modal"     i],
+/* Overlay / interstitial ads */
+[class*="interstitial"     i],
+[class*="overlay-ad"       i],
+[id*="interstitial"        i] {
   display: none !important;
   visibility: hidden !important;
   height: 0 !important;
   max-height: 0 !important;
   overflow: hidden !important;
   pointer-events: none !important;
+}
+
+/* ── PROTECT actual video players — never hide these ── */
+video,
+video *,
+[class*="video-player"] video,
+[class*="videoPlayer"] video,
+[class*="video-js"] video,
+[class*="plyr"] video,
+[class*="jw-video"] video,
+[class*="html5-video"] video {
+  display: revert !important;
+  visibility: visible !important;
+  height: revert !important;
+  max-height: revert !important;
+  overflow: revert !important;
+  pointer-events: auto !important;
 }
 ''';
 
@@ -217,22 +340,95 @@ amp-sticky-ad {
     'amp-sticky-ad',
   ].join(',');
 
+  /* ── cookie consent selectors ── */
+  const CONSENT_SEL = [
+    '[class*="cookie-banner"]',
+    '[class*="cookie_banner"]',
+    '[class*="cookie-consent"]',
+    '[class*="cookie_consent"]',
+    '[class*="CookieConsent"]',
+    '[class*="cc-window"]',
+    '[class*="cc-banner"]',
+    '[class*="gdpr"]',
+    '[class*="consent-banner"]',
+    '[id*="cookie-banner"]',
+    '[id*="cookie_banner"]',
+    '[id*="cookie-consent"]',
+    '[id*="cookie_consent"]',
+    '[id*="gdpr"]',
+    '[id*="consent-banner"]',
+    '[class*="newsletter-popup"]',
+    '[class*="subscribe-modal"]',
+    '[id*="newsletter-popup"]',
+    '[id*="subscribe-modal"]',
+  ].join(',');
+
+  /* ── Accept-all consent buttons ── */
+  const ACCEPT_TEXTS = ['accept all', 'accept cookies', 'i agree', 'agree', 'allow all',
+    'allow cookies', 'ok', 'got it', 'continue', 'dismiss'];
+
+  function tryDismissConsent() {
+    /* Try clicking accept/dismiss buttons */
+    var buttons = document.querySelectorAll('button, a[role="button"], [class*="accept"], [class*="agree"], [class*="dismiss"], [class*="close"]');
+    for (var i = 0; i < buttons.length; i++) {
+      var txt = (buttons[i].textContent || '').trim().toLowerCase();
+      for (var j = 0; j < ACCEPT_TEXTS.length; j++) {
+        if (txt === ACCEPT_TEXTS[j] || txt.indexOf(ACCEPT_TEXTS[j]) !== -1) {
+          try { buttons[i].click(); } catch(_) {}
+          return;
+        }
+      }
+    }
+    /* Fallback: just remove consent banners */
+    document.querySelectorAll(CONSENT_SEL).forEach(function(el) { el.remove(); });
+  }
+
+  /* Check if an element is a video player or contains one */
+  function isVideoPlayer(el) {
+    if (!el || !el.tagName) return false;
+    var tag = el.tagName.toLowerCase();
+    if (tag === 'video' || tag === 'audio') return true;
+    /* Contains a <video> or <audio> element */
+    if (el.querySelector && (el.querySelector('video') || el.querySelector('audio'))) return true;
+    /* Known player class patterns */
+    var cls = (el.className || '').toString().toLowerCase();
+    var id = (el.id || '').toLowerCase();
+    var playerHints = ['video-player', 'videoplayer', 'video-js', 'vjs-', 'plyr', 'jw-', 'jwplayer',
+      'html5-video', 'flowplayer', 'mediaelement', 'mejs', 'bitmovin', 'shaka-', 'hls-player',
+      'dash-player', 'player-container', 'media-player', 'clappr', 'videojs', 'theoplayer'];
+    for (var i = 0; i < playerHints.length; i++) {
+      if (cls.indexOf(playerHints[i]) !== -1 || id.indexOf(playerHints[i]) !== -1) return true;
+    }
+    return false;
+  }
+
   function nuke() {
-    document.querySelectorAll(SEL).forEach(function(el) { el.remove(); });
+    document.querySelectorAll(SEL).forEach(function(el) {
+      /* NEVER remove elements that are part of a video player */
+      if (isVideoPlayer(el)) return;
+      if (el.closest && el.closest('video, [class*="video-player"], [class*="video-js"], [class*="plyr"]')) return;
+      el.remove();
+    });
 
-    /* Remove fixed/sticky overlays that cover content (cookie walls, ad
-       overlays, anti-adblock modals). Keep elements that are clearly nav
-       bars (header/nav/footer). */
+    /* Remove fixed/sticky overlays that cover content */
     document.querySelectorAll('div, section, aside').forEach(function(el) {
-      const s = getComputedStyle(el);
+      var s = getComputedStyle(el);
       if (s.position !== 'fixed' && s.position !== 'sticky') return;
-      const tag = el.tagName.toLowerCase();
+      var tag = el.tagName.toLowerCase();
       if (tag === 'header' || tag === 'nav' || tag === 'footer') return;
+      /* NEVER remove video players */
+      if (isVideoPlayer(el)) return;
 
-      const r = el.getBoundingClientRect();
+      var r = el.getBoundingClientRect();
       /* Full-screen or nearly full-screen overlays */
       if (r.width > window.innerWidth * 0.8 && r.height > window.innerHeight * 0.7) {
         if (s.zIndex && parseInt(s.zIndex, 10) > 999) {
+          el.remove();
+        }
+      }
+      /* Bottom sticky ad banners */
+      if (r.height < 120 && r.bottom >= window.innerHeight - 5) {
+        if (s.zIndex && parseInt(s.zIndex, 10) > 10) {
           el.remove();
         }
       }
@@ -240,30 +436,36 @@ amp-sticky-ad {
 
     /* Re-enable scrolling if a modal hid it */
     if (document.body) {
-      const bs = getComputedStyle(document.body);
+      var bs = getComputedStyle(document.body);
       if (bs.overflow === 'hidden' || bs.overflowY === 'hidden') {
         document.body.style.setProperty('overflow', 'auto', 'important');
       }
     }
     if (document.documentElement) {
-      const hs = getComputedStyle(document.documentElement);
+      var hs = getComputedStyle(document.documentElement);
       if (hs.overflow === 'hidden' || hs.overflowY === 'hidden') {
         document.documentElement.style.setProperty('overflow', 'auto', 'important');
       }
     }
   }
 
-  /* Run immediately + after a short delay (some ads inject late). */
+  /* Run immediately + after delays (some ads inject late). */
   nuke();
-  setTimeout(nuke, 800);
-  setTimeout(nuke, 2500);
+  setTimeout(nuke, 500);
+  setTimeout(nuke, 1500);
+  setTimeout(nuke, 3000);
+  setTimeout(function() { nuke(); tryDismissConsent(); }, 2000);
+  setTimeout(tryDismissConsent, 4000);
 
   /* Observe DOM for dynamically-injected ads. */
   if (typeof MutationObserver !== 'undefined') {
-    new MutationObserver(function() { nuke(); })
-      .observe(document.body || document.documentElement, {
-        childList: true, subtree: true
-      });
+    var throttle = null;
+    new MutationObserver(function() {
+      if (throttle) return;
+      throttle = setTimeout(function() { throttle = null; nuke(); }, 300);
+    }).observe(document.body || document.documentElement, {
+      childList: true, subtree: true
+    });
   }
 })();
 ''';
@@ -277,24 +479,86 @@ amp-sticky-ad {
 (function RLCasterVideoDetector() {
   "use strict";
   var sent = {};
+  var VIDEO_RE = /\.(mp4|m3u8|webm|mkv|avi|mov|flv|ts|mpd)(\?|#|$)/i;
+  var VIDEO_MIME_RE = /^(video\/|application\/x-mpegurl|application\/vnd\.apple\.mpegurl|application\/dash\+xml)/i;
 
   function send(url, type) {
     if (!url || sent[url]) return;
     /* Skip blob:, data:, and tiny tracking pixels */
     if (url.startsWith('blob:') || url.startsWith('data:')) return;
     if (url.length < 10) return;
+    /* Skip known ad/tracking URLs */
+    if (url.indexOf('doubleclick') !== -1 || url.indexOf('googlesyndication') !== -1) return;
+    if (url.indexOf('googleads') !== -1 || url.indexOf('analytics') !== -1) return;
     sent[url] = true;
     try { VideoDetector.postMessage(JSON.stringify({url: url, type: type})); } catch(_) {}
   }
 
-  function scan() {
+  /* ── Layer 1: Intercept XMLHttpRequest ── */
+  (function() {
+    var origOpen = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(method, url) {
+      try {
+        var resolved = new URL(url, location.href).href;
+        if (VIDEO_RE.test(resolved)) {
+          send(resolved, 'xhr');
+        }
+      } catch(_) {}
+      return origOpen.apply(this, arguments);
+    };
+
+    /* Also check response type after load */
+    var origSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function() {
+      var xhr = this;
+      xhr.addEventListener('load', function() {
+        try {
+          var ct = xhr.getResponseHeader('content-type') || '';
+          if (VIDEO_MIME_RE.test(ct) && xhr.responseURL) {
+            send(xhr.responseURL, 'xhr');
+          }
+        } catch(_) {}
+      });
+      return origSend.apply(this, arguments);
+    };
+  })();
+
+  /* ── Layer 2: Intercept fetch() ── */
+  (function() {
+    var origFetch = window.fetch;
+    if (!origFetch) return;
+    window.fetch = function(input, init) {
+      try {
+        var url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        if (url) {
+          var resolved = new URL(url, location.href).href;
+          if (VIDEO_RE.test(resolved)) {
+            send(resolved, 'fetch');
+          }
+        }
+      } catch(_) {}
+      return origFetch.apply(this, arguments).then(function(response) {
+        try {
+          var ct = response.headers.get('content-type') || '';
+          if (VIDEO_MIME_RE.test(ct) && response.url) {
+            send(response.url, 'fetch');
+          }
+        } catch(_) {}
+        return response;
+      });
+    };
+  })();
+
+  /* ── Layer 3: Monitor <video>/<source> elements + attribute changes ── */
+  function scanDOM() {
     /* <video src="..."> */
-    document.querySelectorAll('video[src]').forEach(function(v) {
-      send(v.src, 'video');
+    document.querySelectorAll('video').forEach(function(v) {
+      if (v.src && !v.src.startsWith('blob:')) send(v.src, 'video');
+      if (v.currentSrc && !v.currentSrc.startsWith('blob:')) send(v.currentSrc, 'video');
     });
     /* <video><source src="..."></video> */
     document.querySelectorAll('video source[src]').forEach(function(s) {
-      send(s.src, 'source');
+      if (!s.src.startsWith('blob:')) send(s.src, 'source');
     });
     /* <iframe> that embed known video players */
     document.querySelectorAll('iframe[src]').forEach(function(f) {
@@ -302,34 +566,106 @@ amp-sticky-ad {
       if (s.indexOf('youtube.com/embed') !== -1 ||
           s.indexOf('player.vimeo.com') !== -1 ||
           s.indexOf('dailymotion.com/embed') !== -1 ||
-          s.indexOf('streamable.com') !== -1) {
+          s.indexOf('streamable.com') !== -1 ||
+          s.indexOf('facebook.com/plugins/video') !== -1 ||
+          s.indexOf('twitch.tv/embed') !== -1) {
         send(f.src, 'embed');
       }
     });
     /* <a> links pointing to video files */
     document.querySelectorAll('a[href]').forEach(function(a) {
-      var h = a.href.toLowerCase();
-      if (h.match(/\.(mp4|m3u8|webm|mkv|avi|mov|flv|ts)(\?|$)/)) {
+      if (VIDEO_RE.test(a.href)) {
         send(a.href, 'link');
       }
     });
     /* og:video meta tags */
-    document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"]')
+    document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"], meta[property="og:video:secure_url"]')
       .forEach(function(m) {
         var c = m.getAttribute('content');
         if (c) send(c, 'meta');
       });
+    /* Data attributes on player wrappers */
+    document.querySelectorAll('[data-src], [data-video-url], [data-video-src], [data-stream-url], [data-hls], [data-dash]')
+      .forEach(function(el) {
+        ['data-src', 'data-video-url', 'data-video-src', 'data-stream-url', 'data-hls', 'data-dash'].forEach(function(attr) {
+          var v = el.getAttribute(attr);
+          if (v && VIDEO_RE.test(v)) {
+            try { send(new URL(v, location.href).href, 'data-attr'); } catch(_) {}
+          }
+        });
+      });
+    /* JSON-LD structured data (VideoObject) */
+    document.querySelectorAll('script[type="application/ld+json"]').forEach(function(s) {
+      try {
+        var json = JSON.parse(s.textContent);
+        var items = Array.isArray(json) ? json : [json];
+        items.forEach(function(item) {
+          if (item['@type'] === 'VideoObject') {
+            if (item.contentUrl) send(item.contentUrl, 'json-ld');
+            if (item.embedUrl) send(item.embedUrl, 'json-ld');
+          }
+        });
+      } catch(_) {}
+    });
   }
 
-  scan();
-  setTimeout(scan, 1500);
-  setTimeout(scan, 4000);
+  /* ── Layer 4: PerformanceObserver — catches ALL resource loads ── */
+  (function() {
+    if (typeof PerformanceObserver === 'undefined') return;
+    try {
+      var po = new PerformanceObserver(function(list) {
+        list.getEntries().forEach(function(entry) {
+          var url = entry.name || '';
+          if (VIDEO_RE.test(url)) {
+            send(url, 'resource');
+          }
+          /* Also check initiatorType */
+          if (entry.initiatorType === 'video' || entry.initiatorType === 'media') {
+            if (url && !url.startsWith('blob:') && !url.startsWith('data:')) {
+              send(url, 'resource');
+            }
+          }
+        });
+      });
+      po.observe({entryTypes: ['resource']});
+    } catch(_) {}
+
+    /* Also scan already-loaded resources */
+    try {
+      performance.getEntriesByType('resource').forEach(function(entry) {
+        if (VIDEO_RE.test(entry.name)) {
+          send(entry.name, 'resource');
+        }
+      });
+    } catch(_) {}
+  })();
+
+  /* ── Layer 5: Monitor <video> element creation via MutationObserver ── */
+  scanDOM();
+  setTimeout(scanDOM, 1500);
+  setTimeout(scanDOM, 4000);
 
   if (typeof MutationObserver !== 'undefined' && (document.body || document.documentElement)) {
-    new MutationObserver(function() { scan(); })
-      .observe(document.body || document.documentElement, {
-        childList: true, subtree: true
-      });
+    var throttle = null;
+    new MutationObserver(function(mutations) {
+      /* Quick check if any mutation involves video-related elements */
+      var dominated = false;
+      for (var i = 0; i < mutations.length; i++) {
+        var m = mutations[i];
+        if (m.type === 'attributes') { dominated = true; break; }
+        for (var j = 0; j < m.addedNodes.length; j++) {
+          var n = m.addedNodes[j];
+          if (n.nodeType === 1) { dominated = true; break; }
+        }
+        if (dominated) break;
+      }
+      if (!dominated) return;
+      if (throttle) return;
+      throttle = setTimeout(function() { throttle = null; scanDOM(); }, 500);
+    }).observe(document.body || document.documentElement, {
+      childList: true, subtree: true, attributes: true,
+      attributeFilter: ['src', 'data-src', 'data-video-url']
+    });
   }
 })();
 ''';

@@ -107,7 +107,9 @@ class DevicesIdle extends DevicesState {
 }
 
 class DevicesScanning extends DevicesState {
-  const DevicesScanning();
+  /// Devices found so far — updated live during scan.
+  final List<DlnaDevice> devicesFoundSoFar;
+  const DevicesScanning({this.devicesFoundSoFar = const []});
 }
 
 class DevicesResult extends DevicesState {
@@ -124,11 +126,18 @@ class DevicesNotifier extends StateNotifier<DevicesState> {
   DevicesNotifier(this._dlna) : super(const DevicesIdle());
   final DlnaService _dlna;
 
+  /// Stream-based scan: devices appear in UI as they're discovered.
   Future<void> scan() async {
     state = const DevicesScanning();
     try {
-      final devices = await _dlna.discover();
-      state = DevicesResult(devices);
+      final found = <DlnaDevice>[];
+      await for (final device in _dlna.discoverStream()) {
+        found.add(device);
+        if (mounted) {
+          state = DevicesScanning(devicesFoundSoFar: List.unmodifiable(found));
+        }
+      }
+      state = DevicesResult(found);
     } catch (e) {
       state = DevicesError(_clean(e));
     }
