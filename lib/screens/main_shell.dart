@@ -15,6 +15,7 @@ class MainShell extends ConsumerStatefulWidget {
 
 class _MainShellState extends ConsumerState<MainShell> {
   int _tabIndex = 0;
+  bool _browserInitialised = false;
 
   /// Called from BrowserScreen when the user taps "Cast this page".
   void _onCastUrlFromBrowser(String url) {
@@ -35,7 +36,10 @@ class _MainShellState extends ConsumerState<MainShell> {
         index: _tabIndex,
         children: [
           const HomeScreen(),
-          BrowserScreen(onCastUrl: _onCastUrlFromBrowser),
+          if (_browserInitialised)
+            BrowserScreen(onCastUrl: _onCastUrlFromBrowser)
+          else
+            const SizedBox.shrink(),
         ],
       ),
       bottomNavigationBar: Column(
@@ -45,7 +49,16 @@ class _MainShellState extends ConsumerState<MainShell> {
           const MiniPlayer(),
           NavigationBar(
             selectedIndex: _tabIndex,
-            onDestinationSelected: (i) => setState(() => _tabIndex = i),
+            onDestinationSelected: (i) {
+              if (i == 1 && !_browserInitialised) {
+                setState(() {
+                  _browserInitialised = true;
+                  _tabIndex = i;
+                });
+              } else {
+                setState(() => _tabIndex = i);
+              }
+            },
             height: 64,
             indicatorColor: cs.primaryContainer,
             destinations: const [
