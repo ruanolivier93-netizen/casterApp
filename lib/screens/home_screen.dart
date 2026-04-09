@@ -37,6 +37,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     }
     ref.read(selectedFormatProvider.notifier).state = null;
     ref.read(selectedDeviceProvider.notifier).state = null;
+    ref.read(selectedSubtitleProvider.notifier).state = null;
     ref.read(videoProvider.notifier).extract(url);
     FocusScope.of(context).unfocus();
   }
@@ -111,10 +112,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                 if (videoState is VideoError) ...[
                   const SizedBox(height: 8),
                   _ErrorBanner(videoState.message),
+                  const SizedBox(height: 6),
+                  TextButton.icon(
+                    icon: const Icon(Icons.refresh, size: 16),
+                    label: const Text('Retry'),
+                    onPressed: _extract,
+                  ),
                 ],
               ],
             ),
           ),
+
+          // ── Cast History (shown when idle) ────────────────────────────────
+          if (videoState is VideoIdle) ...[
+            const SizedBox(height: 12),
+            const _CastHistory(),
+          ],
 
           // ── Step 2: Video info + format picker ───────────────────────────────
           if (videoState is VideoLoaded) ...[
@@ -373,8 +386,136 @@ class _FormatPicker extends ConsumerWidget {
             ),
           );
         }),
+
+        // ── Subtitle picker ─────────────────────────────────────────────
+        if (info.subtitles.isNotEmpty) ...[
+          const SizedBox(height: 14),
+          Text('Subtitles',
+              style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                  color: Theme.of(context).colorScheme.onSurfaceVariant)),
+          const SizedBox(height: 6),
+          _SubtitlePicker(subtitles: info.subtitles),
+        ],
       ],
     );
+  }
+}
+
+// ── _SubtitlePicker ───────────────────────────────────────────────────────────
+
+class _SubtitlePicker extends ConsumerWidget {
+  final List<SubtitleTrack> subtitles;
+  const _SubtitlePicker({required this.subtitles});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final selected = ref.watch(selectedSubtitleProvider);
+    final cs = Theme.of(context).colorScheme;
+
+    return Wrap(
+      spacing: 6,
+      runSpacing: 4,
+      children: [
+        // "None" chip
+        ChoiceChip(
+          label: const Text('None', style: TextStyle(fontSize: 12)),
+          selected: selected == null,
+          onSelected: (_) => ref.read(selectedSubtitleProvider.notifier).state = null,
+          visualDensity: VisualDensity.compact,
+        ),
+        ...subtitles.map((s) => ChoiceChip(
+              label: Text(s.label, style: const TextStyle(fontSize: 12)),
+              selected: selected?.language == s.language,
+              onSelected: (_) => ref.read(selectedSubtitleProvider.notifier).state = s,
+              avatar: Icon(Icons.subtitles, size: 14, color: cs.onSurfaceVariant),
+              visualDensity: VisualDensity.compact,
+            )),
+      ],
+    );
+  }
+}
+
+// ── _CastHistory ──────────────────────────────────────────────────────────────
+
+class _CastHistory extends ConsumerWidget {
+  const _CastHistory();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final history = ref.watch(castHistoryProvider);
+    if (history.isEmpty) return const SizedBox.shrink();
+
+    final cs = Theme.of(context).colorScheme;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.history, size: 18, color: cs.onSurfaceVariant),
+            const SizedBox(width: 6),
+            Text('Recently Cast',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                    color: cs.onSurfaceVariant)),
+            const Spacer(),
+            TextButton(
+              onPressed: () => ref.read(castHistoryProvider.notifier).clear(),
+              child: const Text('Clear', style: TextStyle(fontSize: 12)),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        ...history.take(5).map((item) => ListTile(
+              contentPadding: EdgeInsets.zero,
+              dense: true,
+              leading: item.thumbnailUrl != null
+                  ? ClipRRect(
+                      borderRadius: BorderRadius.circular(4),
+                      child: Image.network(
+                        item.thumbnailUrl!,
+                        width: 48,
+                        height: 28,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Container(
+                          width: 48,
+                          height: 28,
+                          color: cs.surfaceContainerHighest,
+                          child: const Icon(Icons.video_file, size: 16),
+                        ),
+                      ),
+                    )
+                  : Icon(Icons.play_circle_outline, color: cs.primary),
+              title: Text(item.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 13)),
+              subtitle: Text(_timeAgo(item.castAt),
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+              trailing: IconButton(
+                icon: Icon(Icons.replay, size: 18, color: cs.primary),
+                tooltip: 'Cast again',
+                onPressed: () {
+                  ref.read(selectedFormatProvider.notifier).state = null;
+                  ref.read(selectedDeviceProvider.notifier).state = null;
+                  ref.read(videoProvider.notifier).extract(item.url);
+                },
+              ),
+            )),
+      ],
+    );
+  }
+
+  String _timeAgo(DateTime dt) {
+    final diff = DateTime.now().difference(dt);
+    if (diff.inMinutes < 1) return 'Just now';
+    if (diff.inMinutes < 60) return '${diff.inMinutes}m ago';
+    if (diff.inHours < 24) return '${diff.inHours}h ago';
+    if (diff.inDays < 7) return '${diff.inDays}d ago';
+    return '${dt.day}/${dt.month}/${dt.year}';
   }
 }
 
@@ -387,6 +528,21 @@ class _DeviceList extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final devicesState = ref.watch(devicesProvider);
     final selectedDevice = ref.watch(selectedDeviceProvider);
+    final lastDeviceLocation = ref.watch(lastDeviceProvider);
+
+    // Auto-select last used device when scan completes
+    if (devicesState is DevicesResult &&
+        selectedDevice == null &&
+        lastDeviceLocation != null) {
+      final match = devicesState.devices
+          .where((d) => d.location == lastDeviceLocation)
+          .firstOrNull;
+      if (match != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          ref.read(selectedDeviceProvider.notifier).state = match;
+        });
+      }
+    }
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
@@ -430,6 +586,12 @@ class _DeviceList extends ConsumerWidget {
         if (devicesState is DevicesError) ...[
           const SizedBox(height: 8),
           _ErrorBanner(devicesState.message),
+          const SizedBox(height: 6),
+          TextButton.icon(
+            icon: const Icon(Icons.refresh, size: 16),
+            label: const Text('Retry scan'),
+            onPressed: () => ref.read(devicesProvider.notifier).scan(),
+          ),
         ],
       ],
     );
@@ -673,9 +835,20 @@ class _CastControlsState extends ConsumerState<_CastControls> {
               textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
             onPressed: () {
-                  // Pick the first subtitle track (prefer non-auto if available).
+                  // Use selected subtitle (from picker) or first available
+                  final selectedSub = ref.read(selectedSubtitleProvider);
                   final subs = videoState.info.subtitles;
-                  final sub = subs.isNotEmpty ? subs.first : null;
+                  final sub = selectedSub ?? (subs.isNotEmpty ? subs.first : null);
+
+                  // Record to history
+                  ref.read(castHistoryProvider.notifier).add(
+                        videoState.sourceUrl,
+                        videoState.info.title,
+                        videoState.info.thumbnailUrl,
+                      );
+
+                  // Remember this device
+                  ref.read(lastDeviceProvider.notifier).save(selectedDevice.location);
 
                   ref.read(castProvider.notifier).cast(
                     device: selectedDevice,

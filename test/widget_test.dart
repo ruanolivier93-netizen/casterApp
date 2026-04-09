@@ -6,8 +6,9 @@ import 'package:video_caster_app/app.dart';
 void main() {
   testWidgets('App renders without crashing', (WidgetTester tester) async {
     await tester.pumpWidget(const ProviderScope(child: VideoCasterApp()));
+    await tester.pump();
     // The app bar title should be visible on launch.
-    expect(find.text('Video Caster'), findsOneWidget);
+    expect(find.text('Ruan Lelanie Caster'), findsOneWidget);
   });
 }
 

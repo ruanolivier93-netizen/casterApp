@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../providers/app_state.dart';
+import '../widgets/mini_player.dart';
 import 'home_screen.dart';
 import 'browser_screen.dart';
 
@@ -37,21 +38,28 @@ class _MainShellState extends ConsumerState<MainShell> {
           BrowserScreen(onCastUrl: _onCastUrlFromBrowser),
         ],
       ),
-      bottomNavigationBar: NavigationBar(
-        selectedIndex: _tabIndex,
-        onDestinationSelected: (i) => setState(() => _tabIndex = i),
-        height: 64,
-        indicatorColor: cs.primaryContainer,
-        destinations: const [
-          NavigationDestination(
-            icon: Icon(Icons.cast_outlined),
-            selectedIcon: Icon(Icons.cast),
-            label: 'Cast',
-          ),
-          NavigationDestination(
-            icon: Icon(Icons.language_outlined),
-            selectedIcon: Icon(Icons.language),
-            label: 'Browse',
+      bottomNavigationBar: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // Mini player — visible on all tabs when casting
+          const MiniPlayer(),
+          NavigationBar(
+            selectedIndex: _tabIndex,
+            onDestinationSelected: (i) => setState(() => _tabIndex = i),
+            height: 64,
+            indicatorColor: cs.primaryContainer,
+            destinations: const [
+              NavigationDestination(
+                icon: Icon(Icons.cast_outlined),
+                selectedIcon: Icon(Icons.cast),
+                label: 'Cast',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.language_outlined),
+                selectedIcon: Icon(Icons.language),
+                label: 'Browse',
+              ),
+            ],
           ),
         ],
       ),

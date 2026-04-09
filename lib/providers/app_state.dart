@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
@@ -331,9 +332,105 @@ final castPositionProvider = Provider<({Duration position, Duration total})>((re
 
 final selectedDeviceProvider = StateProvider<DlnaDevice?>((ref) => null);
 final selectedFormatProvider = StateProvider<StreamFormat?>((ref) => null);
+final selectedSubtitleProvider = StateProvider<SubtitleTrack?>((ref) => null);
 
 // URL injected from the in-app browser's "Cast" button.
 final browserCastUrlProvider = StateProvider<String?>((ref) => null);
+
+// ── Cast History ──────────────────────────────────────────────────────────────
+
+class CastHistoryItem {
+  final String url;
+  final String title;
+  final String? thumbnailUrl;
+  final DateTime castAt;
+
+  CastHistoryItem({
+    required this.url,
+    required this.title,
+    this.thumbnailUrl,
+    DateTime? castAt,
+  }) : castAt = castAt ?? DateTime.now();
+
+  Map<String, dynamic> toJson() => {
+        'url': url,
+        'title': title,
+        'thumbnailUrl': thumbnailUrl,
+        'castAt': castAt.toIso8601String(),
+      };
+
+  factory CastHistoryItem.fromJson(Map<String, dynamic> json) => CastHistoryItem(
+        url: json['url'] as String,
+        title: json['title'] as String,
+        thumbnailUrl: json['thumbnailUrl'] as String?,
+        castAt: DateTime.tryParse(json['castAt'] as String? ?? '') ?? DateTime.now(),
+      );
+}
+
+class CastHistoryNotifier extends StateNotifier<List<CastHistoryItem>> {
+  CastHistoryNotifier() : super([]) {
+    _load();
+  }
+
+  static const _key = 'cast_history';
+  static const _maxItems = 20;
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString(_key);
+    if (raw == null) return;
+    try {
+      final list = (jsonDecode(raw) as List)
+          .map((e) => CastHistoryItem.fromJson(e as Map<String, dynamic>))
+          .toList();
+      state = list;
+    } catch (_) {}
+  }
+
+  Future<void> add(String url, String title, String? thumbnailUrl) async {
+    // Remove duplicate if exists, then prepend
+    final items = state.where((i) => i.url != url).toList();
+    items.insert(0, CastHistoryItem(url: url, title: title, thumbnailUrl: thumbnailUrl));
+    if (items.length > _maxItems) items.removeRange(_maxItems, items.length);
+    state = items;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_key, jsonEncode(items.map((i) => i.toJson()).toList()));
+  }
+
+  Future<void> clear() async {
+    state = [];
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_key);
+  }
+}
+
+final castHistoryProvider =
+    StateNotifierProvider<CastHistoryNotifier, List<CastHistoryItem>>(
+        (_) => CastHistoryNotifier());
+
+// ── Last Used Device ──────────────────────────────────────────────────────────
+
+class LastDeviceNotifier extends StateNotifier<String?> {
+  LastDeviceNotifier() : super(null) {
+    _load();
+  }
+
+  static const _key = 'last_device_location';
+
+  Future<void> _load() async {
+    final prefs = await SharedPreferences.getInstance();
+    state = prefs.getString(_key);
+  }
+
+  Future<void> save(String deviceLocation) async {
+    state = deviceLocation;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_key, deviceLocation);
+  }
+}
+
+final lastDeviceProvider =
+    StateNotifierProvider<LastDeviceNotifier, String?>((_) => LastDeviceNotifier());
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

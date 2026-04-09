@@ -4,6 +4,9 @@
 ///   1. **Domain filter** — blocks navigation/resource requests to known ad domains
 ///   2. **CSS injection** — hides common ad containers via element hiding rules
 ///   3. **JS injection**  — strips ad iframes, overlays, popups, and sticky banners
+///
+/// Also includes a video-detection script that finds `<video>` and `<source>`
+/// elements and reports their URLs to Flutter via a JavaScriptChannel.
 library;
 
 class AdBlocker {
@@ -258,6 +261,72 @@ amp-sticky-ad {
   /* Observe DOM for dynamically-injected ads. */
   if (typeof MutationObserver !== 'undefined') {
     new MutationObserver(function() { nuke(); })
+      .observe(document.body || document.documentElement, {
+        childList: true, subtree: true
+      });
+  }
+})();
+''';
+
+  // ── Layer 4: Video detection script ─────────────────────────────────────
+
+  /// JavaScript that scans the page for video elements and source URLs,
+  /// then sends them to Flutter via the `VideoDetector` JavaScriptChannel.
+  /// Runs with a MutationObserver so dynamically-loaded players are caught.
+  static const videoDetectorScript = r'''
+(function RLCasterVideoDetector() {
+  "use strict";
+  var sent = {};
+
+  function send(url, type) {
+    if (!url || sent[url]) return;
+    /* Skip blob:, data:, and tiny tracking pixels */
+    if (url.startsWith('blob:') || url.startsWith('data:')) return;
+    if (url.length < 10) return;
+    sent[url] = true;
+    try { VideoDetector.postMessage(JSON.stringify({url: url, type: type})); } catch(_) {}
+  }
+
+  function scan() {
+    /* <video src="..."> */
+    document.querySelectorAll('video[src]').forEach(function(v) {
+      send(v.src, 'video');
+    });
+    /* <video><source src="..."></video> */
+    document.querySelectorAll('video source[src]').forEach(function(s) {
+      send(s.src, 'source');
+    });
+    /* <iframe> that embed known video players */
+    document.querySelectorAll('iframe[src]').forEach(function(f) {
+      var s = f.src.toLowerCase();
+      if (s.indexOf('youtube.com/embed') !== -1 ||
+          s.indexOf('player.vimeo.com') !== -1 ||
+          s.indexOf('dailymotion.com/embed') !== -1 ||
+          s.indexOf('streamable.com') !== -1) {
+        send(f.src, 'embed');
+      }
+    });
+    /* <a> links pointing to video files */
+    document.querySelectorAll('a[href]').forEach(function(a) {
+      var h = a.href.toLowerCase();
+      if (h.match(/\.(mp4|m3u8|webm|mkv|avi|mov|flv|ts)(\?|$)/)) {
+        send(a.href, 'link');
+      }
+    });
+    /* og:video meta tags */
+    document.querySelectorAll('meta[property="og:video"], meta[property="og:video:url"]')
+      .forEach(function(m) {
+        var c = m.getAttribute('content');
+        if (c) send(c, 'meta');
+      });
+  }
+
+  scan();
+  setTimeout(scan, 1500);
+  setTimeout(scan, 4000);
+
+  if (typeof MutationObserver !== 'undefined' && (document.body || document.documentElement)) {
+    new MutationObserver(function() { scan(); })
       .observe(document.body || document.documentElement, {
         childList: true, subtree: true
       });
