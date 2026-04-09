@@ -4,7 +4,6 @@ import 'package:cached_network_image/cached_network_image.dart';
 import '../providers/app_state.dart';
 import '../models/video_info.dart';
 import '../models/dlna_device.dart';
-import '../services/dlna_service.dart';
 
 class HomeScreen extends ConsumerStatefulWidget {
   const HomeScreen({super.key});
@@ -500,7 +499,7 @@ class _CastControlsState extends ConsumerState<_CastControls> {
   }
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  Widget build(BuildContext context) {
     final castState = ref.watch(castProvider);
     final progress = ref.watch(castPositionProvider);
     final videoState = ref.watch(videoProvider);
