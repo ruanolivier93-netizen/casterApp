@@ -480,12 +480,14 @@ class _CastControlsState extends ConsumerState<_CastControls> {
   // Volume is kept as local UI state; 0–100, null = not yet known.
   double? _volume;
   bool _volumeLoading = false;
+  bool _volumeFetched = false; // prevent infinite retry when TV returns null
 
   Future<void> _fetchVolume(DlnaDevice device) async {
-    if (_volumeLoading) return;
+    if (_volumeLoading || _volumeFetched) return;
     setState(() => _volumeLoading = true);
     try {
       final v = await ref.read(dlnaServiceProvider).getVolume(device);
+      _volumeFetched = true;
       if (mounted && v != null) setState(() => _volume = v.toDouble());
     } finally {
       if (mounted) setState(() => _volumeLoading = false);
@@ -538,7 +540,7 @@ class _CastControlsState extends ConsumerState<_CastControls> {
 
     if (castState is CastPlaying) {
       // Fetch current volume from TV once when we first see a device.
-      if (_volume == null && castState.device.renderingControlUrl != null) {
+      if (!_volumeFetched && castState.device.renderingControlUrl != null) {
         WidgetsBinding.instance.addPostFrameCallback(
           (_) => _fetchVolume(castState.device),
         );
@@ -615,7 +617,10 @@ class _CastControlsState extends ConsumerState<_CastControls> {
                 icon: const Icon(Icons.stop),
                 label: const Text('Stop'),
                 onPressed: () {
-                  setState(() => _volume = null);
+                  setState(() {
+                    _volume = null;
+                    _volumeFetched = false;
+                  });
                   ref.read(castProvider.notifier).stop();
                 },
               ),
