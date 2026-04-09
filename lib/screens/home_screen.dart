@@ -48,13 +48,22 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final castState = ref.watch(castProvider);
     final isCasting = castState is CastPlaying;
 
+    // If a URL was injected from the in-app browser, fill the text field.
+    final browserUrl = ref.watch(browserCastUrlProvider);
+    if (browserUrl != null && browserUrl.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _urlController.text = browserUrl;
+        ref.read(browserCastUrlProvider.notifier).state = null;
+      });
+    }
+
     return Scaffold(
       appBar: AppBar(
         leading: const Padding(
           padding: EdgeInsets.all(12.0),
           child: Icon(Icons.cast, size: 24),
         ),
-        title: const Text('Video Caster'),
+        title: const Text('Ruan Lelanie Caster'),
         centerTitle: false,
         actions: [
           IconButton(
@@ -139,7 +148,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
         ],
       ),
       // ── Bottom: Route-through-phone toggle ──────────────────────────────────
-      bottomNavigationBar: const _RouteToggleBar(),
+      persistentFooterButtons: [const _RouteToggleBar()],
     );
   }
 
@@ -663,12 +672,20 @@ class _CastControlsState extends ConsumerState<_CastControls> {
               padding: const EdgeInsets.symmetric(vertical: 14),
               textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
-            onPressed: () => ref.read(castProvider.notifier).cast(
-                  device: selectedDevice,
-                  format: selectedFormat,
-                  title: videoState.info.title,
-                  routeThroughPhone: settings.routeThroughPhone,
-                ),
+            onPressed: () {
+                  // Pick the first subtitle track (prefer non-auto if available).
+                  final subs = videoState.info.subtitles;
+                  final sub = subs.isNotEmpty ? subs.first : null;
+
+                  ref.read(castProvider.notifier).cast(
+                    device: selectedDevice,
+                    format: selectedFormat,
+                    title: videoState.info.title,
+                    routeThroughPhone: settings.routeThroughPhone,
+                    subtitleSrt: sub?.srtContent,
+                    durationSeconds: videoState.info.durationSeconds,
+                  );
+                },
           ),
           const SizedBox(height: 8),
           Row(children: [

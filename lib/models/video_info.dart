@@ -16,12 +16,24 @@ class StreamFormat {
   });
 }
 
+class SubtitleTrack {
+  final String language;   // e.g. "en", "fr"
+  final String label;      // e.g. "English", "English (auto)"
+  final String srtContent; // full SRT subtitle text
+  const SubtitleTrack({
+    required this.language,
+    required this.label,
+    required this.srtContent,
+  });
+}
+
 class VideoInfo {
   final String title;
   final String? thumbnailUrl;
   final int? durationSeconds;
   final String? uploader;
   final List<StreamFormat> formats;
+  final List<SubtitleTrack> subtitles;
 
   const VideoInfo({
     required this.title,
@@ -29,5 +41,6 @@ class VideoInfo {
     this.durationSeconds,
     this.uploader,
     required this.formats,
+    this.subtitles = const [],
   });
 }

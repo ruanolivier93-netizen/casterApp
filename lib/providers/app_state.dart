@@ -196,21 +196,30 @@ class CastNotifier extends StateNotifier<CastState> {
     required StreamFormat format,
     required String title,
     required bool routeThroughPhone,
+    String? subtitleSrt,
+    int? durationSeconds,
   }) async {
     state = const CastPreparing();
     try {
-      final String castUrl;
+      String castUrl;
+      String? subtitleUrl;
+
       if (routeThroughPhone) {
-        final proxyUrl = await _proxy.start(streamUrl: format.url);
-        if (proxyUrl == null) {
+        final baseUrl = await _proxy.start(
+          streamUrl: format.url,
+          subtitleSrt: subtitleSrt,
+        );
+        if (baseUrl == null) {
           throw Exception('Could not start proxy. Make sure you\'re on WiFi.');
         }
-        castUrl = proxyUrl;
+        castUrl = '$baseUrl/stream';
+        if (subtitleSrt != null) subtitleUrl = '$baseUrl/subtitle.srt';
       } else {
         castUrl = format.url;
       }
 
-      await _dlna.setUri(device, castUrl, title);
+      await _dlna.setUri(device, castUrl, title,
+          subtitleUrl: subtitleUrl, durationSeconds: durationSeconds);
       await _dlna.play(device);
 
       state = CastPlaying(
@@ -322,6 +331,9 @@ final castPositionProvider = Provider<({Duration position, Duration total})>((re
 
 final selectedDeviceProvider = StateProvider<DlnaDevice?>((ref) => null);
 final selectedFormatProvider = StateProvider<StreamFormat?>((ref) => null);
+
+// URL injected from the in-app browser's "Cast" button.
+final browserCastUrlProvider = StateProvider<String?>((ref) => null);
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 

@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'screens/home_screen.dart';
+import 'screens/main_shell.dart';
 
 class VideoCasterApp extends StatelessWidget {
   const VideoCasterApp({super.key});
@@ -8,12 +8,12 @@ class VideoCasterApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Video Caster',
+      title: 'Ruan Lelanie Caster',
       debugShowCheckedModeBanner: false,
       themeMode: ThemeMode.dark,
       theme: _buildTheme(Brightness.light),
       darkTheme: _buildTheme(Brightness.dark),
-      home: const HomeScreen(),
+      home: const MainShell(),
     );
   }
 

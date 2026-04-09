@@ -147,8 +147,12 @@ class DlnaService {
 
   // ── AVTransport Control ─────────────────────────────────────────────────────
 
-  Future<void> setUri(DlnaDevice device, String uri, String title) async {
-    final metadata = _buildDIDL(title, uri);
+  Future<void> setUri(DlnaDevice device, String uri, String title, {
+    String? subtitleUrl,
+    int? durationSeconds,
+  }) async {
+    final metadata = _buildDIDL(title, uri,
+        subtitleUrl: subtitleUrl, durationSeconds: durationSeconds);
     await _soap(
       device.controlUrl,
       'SetAVTransportURI',
@@ -267,27 +271,71 @@ class DlnaService {
     return utf8.decode(response.bodyBytes);
   }
 
-  String _buildDIDL(String title, String uri) {
+  String _buildDIDL(String title, String uri, {
+    String? subtitleUrl,
+    int? durationSeconds,
+  }) {
     final mime = _mimeType(uri);
+    final isAudio = mime.startsWith('audio/');
+    final upnpClass = isAudio ? 'object.item.audioItem.musicTrack' : 'object.item.videoItem';
+
+    // Build the <res> attribute string with optional duration.
+    final resBuf = StringBuffer('protocolInfo="http-get:*:$mime:*"');
+    if (durationSeconds != null && durationSeconds > 0) {
+      final h = (durationSeconds ~/ 3600).toString().padLeft(2, '0');
+      final m = ((durationSeconds % 3600) ~/ 60).toString().padLeft(2, '0');
+      final s = (durationSeconds % 60).toString().padLeft(2, '0');
+      resBuf.write(' duration="$h:$m:$s"');
+    }
+
+    // Samsung-style <sec:CaptionInfoEx> for subtitles — most widely supported.
+    var captionTag = '';
+    if (subtitleUrl != null) {
+      captionTag =
+          '<sec:CaptionInfoEx sec:type="srt" xmlns:sec="http://www.sec.co.kr/">'
+          '${_esc(subtitleUrl)}'
+          '</sec:CaptionInfoEx>'
+          '<res protocolInfo="http-get:*:application/x-subrip:*">'
+          '${_esc(subtitleUrl)}'
+          '</res>';
+    }
+
     return '<DIDL-Lite xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" '
         'xmlns:dc="http://purl.org/dc/elements/1.1/" '
-        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/">'
+        'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" '
+        'xmlns:sec="http://www.sec.co.kr/">'
         '<item id="0" parentID="-1" restricted="1">'
         '<dc:title>${_esc(title)}</dc:title>'
-        '<upnp:class>object.item.videoItem</upnp:class>'
-        '<res protocolInfo="http-get:*:$mime:*">${_esc(uri)}</res>'
+        '<upnp:class>$upnpClass</upnp:class>'
+        '<res $resBuf>${_esc(uri)}</res>'
+        '$captionTag'
         '</item>'
         '</DIDL-Lite>';
   }
 
   String _mimeType(String uri) {
     final lower = uri.toLowerCase().split('?').first;
+    // HLS / DASH
     if (lower.contains('.m3u8')) return 'video/x-mpegurl';
+    if (lower.endsWith('.mpd')) return 'application/dash+xml';
+    // Video
     if (lower.endsWith('.webm')) return 'video/webm';
     if (lower.endsWith('.mkv')) return 'video/x-matroska';
     if (lower.endsWith('.avi')) return 'video/x-msvideo';
     if (lower.endsWith('.mov') || lower.endsWith('.qt')) return 'video/quicktime';
     if (lower.endsWith('.ts')) return 'video/mp2t';
+    if (lower.endsWith('.flv')) return 'video/x-flv';
+    if (lower.endsWith('.3gp')) return 'video/3gpp';
+    if (lower.endsWith('.wmv')) return 'video/x-ms-wmv';
+    if (lower.endsWith('.m4v')) return 'video/mp4';
+    // Audio
+    if (lower.endsWith('.mp3')) return 'audio/mpeg';
+    if (lower.endsWith('.aac') || lower.endsWith('.m4a')) return 'audio/mp4';
+    if (lower.endsWith('.flac')) return 'audio/flac';
+    if (lower.endsWith('.ogg') || lower.endsWith('.oga')) return 'audio/ogg';
+    if (lower.endsWith('.wav')) return 'audio/wav';
+    if (lower.endsWith('.wma')) return 'audio/x-ms-wma';
+    if (lower.endsWith('.opus')) return 'audio/opus';
     return 'video/mp4'; // Safe default for most direct streams.
   }
 
