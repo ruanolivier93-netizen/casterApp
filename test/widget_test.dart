@@ -1,3 +1,6 @@
+import 'dart:ui' show Color;
+
+import 'package:flutter/widgets.dart' show BuildContext, SizedBox, Widget;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:webview_flutter_platform_interface/webview_flutter_platform_interface.dart';
