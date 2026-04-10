@@ -232,14 +232,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           onMessageReceived: (msg) => _onNewTabRequested(msg.message))
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
-          if (AdBlocker.shouldBlock(request.url)) {
-            _onAdBlocked(tab, request.url);
-            return NavigationDecision.prevent;
-          }
-          if (AdBlocker.isPopupOrRedirect(request.url)) {
-            _onAdBlocked(tab, request.url);
-            return NavigationDecision.prevent;
-          }
           return NavigationDecision.navigate;
         },
         onPageStarted: (pageUrl) {
@@ -253,14 +245,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           if (_tabs.indexOf(tab) == _activeTabIndex) {
             _urlController.text = pageUrl;
           }
-          tab.controller.runJavaScript('''
-            (function(){
-              var s = document.createElement('style');
-              s.textContent = ${_escapeJsString(AdBlocker.cssRules)};
-              (document.head || document.documentElement).appendChild(s);
-            })();
-          ''');
-          tab.controller.runJavaScript(AdBlocker.earlyJsScript);
           tab.controller.runJavaScript(AdBlocker.videoDetectorScript);
         },
         onProgress: (p) {
@@ -281,7 +265,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           if (_tabs.indexOf(tab) == _activeTabIndex) {
             _urlController.text = pageUrl;
           }
-          tab.controller.runJavaScript(AdBlocker.jsScript);
           tab.controller.runJavaScript(AdBlocker.videoDetectorScript);
           // Extract page thumbnail (og:image) for video list
           tab.controller.runJavaScript('''
@@ -360,8 +343,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
 
   void _onNewTabRequested(String url) {
     if (url.isEmpty) return;
-    if (AdBlocker.shouldBlock(url) || AdBlocker.isPopupOrRedirect(url)) return;
-
     _addNewTab(url: url, switchTo: false);
 
     if (mounted) {
@@ -398,6 +379,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     } catch (_) {}
   }
 
+  // ignore: unused_element — temporarily disabled ad blocker
   void _onAdBlocked(_BrowserTab tab, String url) {
     try {
       final host = Uri.tryParse(url)?.host ?? '';
@@ -447,6 +429,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     _controller.reload();
   }
 
+  // ignore: unused_element — temporarily disabled ad blocker
   static String _escapeJsString(String s) {
     final escaped = s
         .replaceAll('\\', '\\\\')
@@ -674,9 +657,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                   .toList(),
             ),
           ),
-          // ── Ad-blocked notification bar ──
-          if (_activeTab.lastBlockedDomain != null)
-            _buildAdBlockedBar(cs),
+
           // ── Inline Cast Panel ─────────────────────────────────────────────
           const _BrowserCastPanel(),
         ],
@@ -1226,6 +1207,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     );
   }
 
+  // ignore: unused_element — temporarily disabled ad blocker
   Widget _buildAdBlockedBar(ColorScheme cs) {
     final domain = _activeTab.lastBlockedDomain;
     if (domain == null) return const SizedBox.shrink();
