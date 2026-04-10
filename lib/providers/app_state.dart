@@ -278,6 +278,7 @@ class CastNotifier extends StateNotifier<CastState> {
   Duration _position = Duration.zero;
   Duration _totalDuration = Duration.zero;
   int _pollFailures = 0;
+  int _consecutiveStoppedPolls = 0;
   DateTime? _castStartTime;
   bool _hasEverPlayed = false;
 
@@ -342,6 +343,7 @@ class CastNotifier extends StateNotifier<CastState> {
       await CastBackgroundService.start('Casting to ${device.name}');
       _castStartTime = DateTime.now();
       _hasEverPlayed = false;
+      _consecutiveStoppedPolls = 0;
       _startProgressPolling(device);
     } catch (e) {
       await _proxy.stop();
@@ -407,6 +409,7 @@ class CastNotifier extends StateNotifier<CastState> {
     _totalDuration = Duration.zero;
     _castStartTime = null;
     _hasEverPlayed = false;
+    _consecutiveStoppedPolls = 0;
     state = const CastIdle();
   }
 
@@ -436,15 +439,23 @@ class CastNotifier extends StateNotifier<CastState> {
           switch (status.state) {
             case 'IDLE':
               if (!inGracePeriod && _hasEverPlayed) {
-                await _onNaturalStop();
+                _consecutiveStoppedPolls++;
+                // Require 3 consecutive STOPPED/IDLE polls (~6 seconds)
+                // before treating it as a natural end.  TVs often briefly
+                // report IDLE/STOPPED during rebuffering or segment gaps.
+                if (_consecutiveStoppedPolls >= 3) {
+                  await _onNaturalStop();
+                }
               }
             case 'PAUSED':
               _hasEverPlayed = true;
+              _consecutiveStoppedPolls = 0;
               final s = state;
               if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
             case 'PLAYING':
             case 'BUFFERING':
               _hasEverPlayed = true;
+              _consecutiveStoppedPolls = 0;
               final s = state;
               if (s is CastPlaying && s.isPaused) state = s.copyWith(isPaused: false);
           }
@@ -458,15 +469,23 @@ class CastNotifier extends StateNotifier<CastState> {
             case 'STOPPED':
             case 'NO_MEDIA_PRESENT':
               if (!inGracePeriod && _hasEverPlayed) {
-                await _onNaturalStop();
+                _consecutiveStoppedPolls++;
+                // Require 3 consecutive STOPPED/NO_MEDIA polls (~6 seconds)
+                // before treating it as a natural end.  TVs often briefly
+                // report these states during rebuffering or segment gaps.
+                if (_consecutiveStoppedPolls >= 3) {
+                  await _onNaturalStop();
+                }
               }
             case 'PAUSED_PLAYBACK':
               _hasEverPlayed = true;
+              _consecutiveStoppedPolls = 0;
               final s = state;
               if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
             case 'PLAYING':
             case 'TRANSITIONING':
               _hasEverPlayed = true;
+              _consecutiveStoppedPolls = 0;
               final s = state;
               if (s is CastPlaying && s.isPaused) state = s.copyWith(isPaused: false);
           }
