@@ -109,11 +109,15 @@ class StreamProxyService {
       : null;
 
   /// Probes the upstream stream to learn Content-Length and duration.
+  /// Uses a **separate** HTTP client so we don't interfere with the main
+  /// proxy client's connection pool.
   /// For HLS, fetches the manifest and sums `#EXTINF:` tags.
-  /// For direct streams, does a HEAD request to get Content-Length.
+  /// For direct streams, does a HEAD request followed by a partial GET
+  /// to discover Content-Length.
   Future<void> _probeStream(String streamUrl) async {
     _probedContentLength = null;
     _probedDurationSeconds = null;
+    final probeClient = http.Client();
     try {
       final parsedUrl = Uri.parse(streamUrl);
       final ua = defaultTargetPlatform == TargetPlatform.iOS
@@ -134,7 +138,7 @@ class StreamProxyService {
         // HLS — fetch manifest and calculate total duration from #EXTINF tags
         final req = http.Request('GET', Uri.parse(streamUrl))
           ..headers.addAll(headers);
-        final resp = await _client!.send(req).timeout(const Duration(seconds: 15));
+        final resp = await probeClient.send(req).timeout(const Duration(seconds: 15));
         final body = await resp.stream.bytesToString();
         double totalDuration = 0;
         final extinfRegex = RegExp(r'#EXTINF:\s*([\d.]+)');
@@ -154,7 +158,7 @@ class StreamProxyService {
             try {
               final vReq = http.Request('GET', Uri.parse(variantUrl))
                 ..headers.addAll(headers);
-              final vResp = await _client!.send(vReq).timeout(const Duration(seconds: 15));
+              final vResp = await probeClient.send(vReq).timeout(const Duration(seconds: 15));
               final vBody = await vResp.stream.bytesToString();
               double vDuration = 0;
               for (final m in extinfRegex.allMatches(vBody)) {
@@ -167,18 +171,49 @@ class StreamProxyService {
           }
         }
       } else {
-        // Direct stream — HEAD request to get Content-Length
-        final req = http.Request('HEAD', Uri.parse(streamUrl))
-          ..headers.addAll(headers);
-        final resp = await _client!.send(req).timeout(const Duration(seconds: 15));
-        await resp.stream.drain<void>();
-        final cl = resp.headers['content-length'];
-        if (cl != null) {
-          _probedContentLength = int.tryParse(cl);
+        // Direct stream — try HEAD first, then small Range GET as fallback
+        // Many CDNs / movie sites don't respond to HEAD, so we try both.
+        for (final method in ['HEAD', 'GET']) {
+          try {
+            final probHeaders = Map<String, String>.from(headers);
+            if (method == 'GET') {
+              // Only request first byte so CDN provides Content-Range with total size
+              probHeaders['Range'] = 'bytes=0-0';
+            }
+            final req = http.Request(method, Uri.parse(streamUrl))
+              ..headers.addAll(probHeaders);
+            final resp = await probeClient.send(req).timeout(const Duration(seconds: 15));
+            await resp.stream.drain<void>();
+
+            // Check Content-Range first (from 206 response)
+            final cr = resp.headers['content-range'];
+            if (cr != null) {
+              final m = RegExp(r'/(\d+)').firstMatch(cr);
+              if (m != null) {
+                _probedContentLength = int.tryParse(m.group(1)!);
+                break;
+              }
+            }
+            // Fall back to Content-Length
+            final cl = resp.headers['content-length'];
+            if (cl != null) {
+              final len = int.tryParse(cl);
+              // For HEAD or a full 200, content-length is the file size.
+              // For a Range: bytes=0-0 response (206), content-length is 1.
+              if (len != null && len > 1) {
+                _probedContentLength = len;
+                break;
+              }
+            }
+          } catch (_) {
+            // Try next method
+          }
         }
       }
     } catch (_) {
       // Probing is best-effort — don't block the cast if it fails.
+    } finally {
+      probeClient.close();
     }
   }
 
@@ -316,11 +351,13 @@ class StreamProxyService {
   /// header for the next chunk.  We detect this and keep reconnecting until
   /// all data is delivered to the TV.
   Future<void> _proxyRemoteStream(HttpRequest req, String streamUrl) async {
+    // Use a fresh client for each proxy request so stale connections don't
+    // cause failures. The main _client is only used for probing.
+    final reqClient = http.Client();
     try {
       final parsedUrl = Uri.parse(streamUrl);
       final isHead = req.method == 'HEAD';
 
-      // Use a platform-appropriate User-Agent so CDNs don't reject requests.
       final ua = defaultTargetPlatform == TargetPlatform.iOS
           ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
               'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
@@ -345,17 +382,17 @@ class StreamProxyService {
       final method = isHead ? 'HEAD' : 'GET';
       http.StreamedResponse? upstreamResp;
       Object? lastError;
-      for (var attempt = 0; attempt < 2; attempt++) {
+      for (var attempt = 0; attempt < 3; attempt++) {
         try {
           final upstreamReq = http.Request(method, Uri.parse(streamUrl))
             ..headers.addAll(baseHeaders);
-          upstreamResp = await _client!.send(upstreamReq)
+          upstreamResp = await reqClient.send(upstreamReq)
               .timeout(const Duration(seconds: 60));
           break;
         } catch (e) {
           lastError = e;
-          if (attempt == 0) {
-            await Future.delayed(const Duration(milliseconds: 500));
+          if (attempt < 2) {
+            await Future.delayed(Duration(milliseconds: 500 * (attempt + 1)));
           }
         }
       }
@@ -368,25 +405,44 @@ class StreamProxyService {
         return;
       }
 
-      // ── Set response headers from the initial upstream response ────────
-      req.response.statusCode = upstreamResp.statusCode;
+      // ── Determine the total file size ──────────────────────────────────
+      // Use upstream response headers first, then fall back to probed value.
+      int? totalFileSize = _parseExpectedLength(upstreamResp);
+      if (totalFileSize == null && _probedContentLength != null) {
+        totalFileSize = _probedContentLength;
+      }
 
-      for (final entry in upstreamResp.headers.entries) {
-        switch (entry.key.toLowerCase()) {
-          case 'content-type':
-          case 'content-length':
-          case 'content-range':
-          case 'accept-ranges':
-          case 'cache-control':
-            req.response.headers.set(entry.key, entry.value);
+      // ── Set response headers ───────────────────────────────────────────
+      // If we know the total size, tell the TV via Content-Length. This is
+      // crucial for TVs to show the progress bar and allow seeking.
+      if (totalFileSize != null && tvRange == null) {
+        // No Range from TV → serve full file
+        req.response.statusCode = 200;
+        req.response.headers.set('content-length', '$totalFileSize');
+      } else if (totalFileSize != null && tvRange != null) {
+        // TV sent Range → serve partial content with proper headers
+        final rangeMatch = RegExp(r'bytes=(\d+)-(\d*)').firstMatch(tvRange);
+        final start = int.parse(rangeMatch?.group(1) ?? '0');
+        final end = totalFileSize - 1;
+        req.response.statusCode = 206;
+        req.response.headers.set('content-range', 'bytes $start-$end/$totalFileSize');
+        req.response.headers.set('content-length', '${end - start + 1}');
+      } else {
+        // Unknown size — pass through upstream status
+        req.response.statusCode = upstreamResp.statusCode;
+        for (final entry in upstreamResp.headers.entries) {
+          switch (entry.key.toLowerCase()) {
+            case 'content-length':
+            case 'content-range':
+              req.response.headers.set(entry.key, entry.value);
+          }
         }
       }
-      if (!upstreamResp.headers.containsKey('accept-ranges')) {
-        req.response.headers.set('accept-ranges', 'bytes');
-      }
-      if (!upstreamResp.headers.containsKey('content-type')) {
-        req.response.headers.set('content-type', _guessMime(streamUrl));
-      }
+
+      // Always set these regardless
+      final upstreamCt = upstreamResp.headers['content-type'];
+      req.response.headers.set('content-type', upstreamCt ?? _guessMime(streamUrl));
+      req.response.headers.set('accept-ranges', 'bytes');
       req.response.headers.set('Access-Control-Allow-Origin', '*');
 
       if (isHead) {
@@ -396,8 +452,6 @@ class StreamProxyService {
       }
 
       // ── Pipe data with auto-resume ─────────────────────────────────────
-      // Determine expected total size so we know when to stop.
-      final expectedLength = _parseExpectedLength(upstreamResp);
       int bytesSent = 0;
 
       // Pipe the initial response body
@@ -406,11 +460,17 @@ class StreamProxyService {
         bytesSent += chunk.length;
       }
 
-      // Auto-resume: if the CDN closed the connection before all bytes
-      // were delivered (common with YouTube/CDN throttling), reconnect
-      // with a Range header and keep piping.
-      if (expectedLength != null && bytesSent < expectedLength) {
-        // Calculate the absolute start offset (in case TV sent Range initially)
+      // ── Auto-resume when CDN closes connection prematurely ─────────────
+      // Works two ways:
+      //  1. Known size: resume when bytesSent < totalFileSize
+      //  2. Unknown size: if we got some data but the stream closed
+      //     suspiciously fast (< 30MB in under ~10 seconds of data),
+      //     try one resume with Range header - if server accepts, keep going.
+      final knownSize = totalFileSize;
+      final needsResume = (knownSize != null && bytesSent < knownSize) ||
+          (knownSize == null && bytesSent > 0 && bytesSent < 30 * 1024 * 1024);
+
+      if (needsResume) {
         int absoluteOffset = bytesSent;
         if (tvRange != null) {
           final match = RegExp(r'bytes=(\d+)-').firstMatch(tvRange);
@@ -419,28 +479,54 @@ class StreamProxyService {
           }
         }
 
-        const maxResumes = 500; // safety limit (~500 reconnections)
-        for (var i = 0; i < maxResumes && bytesSent < expectedLength; i++) {
+        const maxResumes = 2000;
+        for (var i = 0; i < maxResumes; i++) {
+          // Stop if we've delivered everything
+          if (knownSize != null && bytesSent >= knownSize) break;
+
           try {
-            final resumeHeaders = Map<String, String>.from(baseHeaders);
-            resumeHeaders['Range'] = 'bytes=$absoluteOffset-';
+            final resumeClient = http.Client();
+            try {
+              final resumeHeaders = Map<String, String>.from(baseHeaders);
+              resumeHeaders['Range'] = 'bytes=$absoluteOffset-';
+              // Remove any original Range the TV sent
+              resumeHeaders.remove('range');
+              resumeHeaders['Range'] = 'bytes=$absoluteOffset-';
 
-            final resumeReq = http.Request('GET', Uri.parse(streamUrl))
-              ..headers.addAll(resumeHeaders);
-            final resumeResp = await _client!.send(resumeReq)
-                .timeout(const Duration(seconds: 60));
+              final resumeReq = http.Request('GET', Uri.parse(streamUrl))
+                ..headers.addAll(resumeHeaders);
+              final resumeResp = await resumeClient.send(resumeReq)
+                  .timeout(const Duration(seconds: 60));
 
-            int chunkBytes = 0;
-            await for (final chunk in resumeResp.stream) {
-              req.response.add(chunk);
-              chunkBytes += chunk.length;
+              // If server returns 416 (Range Not Satisfiable), we're done
+              if (resumeResp.statusCode == 416) {
+                await resumeResp.stream.drain<void>();
+                break;
+              }
+              // If server returns 200 (ignores Range), we can't auto-resume
+              if (resumeResp.statusCode == 200 && i == 0) {
+                // Server doesn't support Range — pipe what we can and stop
+                await for (final chunk in resumeResp.stream) {
+                  req.response.add(chunk);
+                  bytesSent += chunk.length;
+                }
+                break;
+              }
+
+              int chunkBytes = 0;
+              await for (final chunk in resumeResp.stream) {
+                req.response.add(chunk);
+                chunkBytes += chunk.length;
+              }
+
+              if (chunkBytes == 0) break;
+              bytesSent += chunkBytes;
+              absoluteOffset += chunkBytes;
+            } finally {
+              resumeClient.close();
             }
-
-            if (chunkBytes == 0) break; // server returned empty — we're done
-            bytesSent += chunkBytes;
-            absoluteOffset += chunkBytes;
           } catch (_) {
-            break; // can't resume further — deliver what we have
+            break;
           }
         }
       }

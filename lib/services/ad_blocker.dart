@@ -1321,20 +1321,25 @@ video *,
   window.__rlVideoDetector = true;
 
   var sent = {};
-  var VIDEO_RE = /\.(mp4|m3u8|webm|mkv|avi|mov|flv|ts|mpd|m4v|f4v|m4s)(\?|#|$)/i;
-  var VIDEO_MIME_RE = /^(video\/|application\/x-mpegurl|application\/vnd\.apple\.mpegurl|application\/dash\+xml|application\/octet-stream.*video)/i;
+  var VIDEO_RE = /\.(mp4|m3u8|webm|mkv|avi|mov|flv|mpd|m4v|f4v)(\?|#|$)/i;
+  var VIDEO_MIME_RE = /^(video\/|application\/x-mpegurl|application\/vnd\.apple\.mpegurl|application\/dash\+xml)/i;
+
+  /* ── Junk URL filter: skip ads, tracking, tiny segments, previews ── */
+  var JUNK_RE = /doubleclick|googlesyndication|googleads|\/analytics|adnxs|facebook\.net|\/pixel|\/beacon|\/tracker|\/tracking|\/ads\/|\/ad\/|\/preroll|\/midroll|\/postroll|popads|popunder|\.gif(\?|$)|\.png(\?|$)|\.jpg(\?|$)|\.svg(\?|$)/i;
+  /* Skip individual HLS/DASH segments (.ts, .m4s) — we want manifests only */
+  var SEGMENT_RE = /\.(ts|m4s|aac)(\?|#|$)/i;
 
   function send(url, type) {
     if (!url || sent[url]) return;
     if (url.startsWith('blob:') || url.startsWith('data:')) return;
-    if (url.length < 10) return;
-    /* Skip ad/tracking URLs */
+    if (url.length < 15 || url.length > 4000) return;
     var lower = url.toLowerCase();
-    if (lower.indexOf('doubleclick') !== -1 || lower.indexOf('googlesyndication') !== -1) return;
-    if (lower.indexOf('googleads') !== -1 || lower.indexOf('/analytics') !== -1) return;
-    if (lower.indexOf('adnxs') !== -1 || lower.indexOf('facebook.net') !== -1) return;
+    /* Skip junk / ad / tracking URLs */
+    if (JUNK_RE.test(lower)) return;
+    /* Skip individual segments — these are short chunks, not full videos */
+    if (SEGMENT_RE.test(lower)) return;
+    /* Skip very short query strings that indicate tracking pixels */
     if (lower.indexOf('/pixel') !== -1 || lower.indexOf('/beacon') !== -1) return;
-    if (lower.indexOf('/tracker') !== -1 || lower.indexOf('/tracking') !== -1) return;
     sent[url] = true;
     try { window.flutter_inappwebview.callHandler('VideoDetector', JSON.stringify({url: url, type: type})); } catch(_) {}
   }
@@ -1407,6 +1412,7 @@ video *,
         send(f.src, 'embed');
       }
     });
+    /* Only detect <a> links with video extensions — skip plain links */
     document.querySelectorAll('a[href]').forEach(function(a) {
       if (VIDEO_RE.test(a.href)) send(a.href, 'link');
     });

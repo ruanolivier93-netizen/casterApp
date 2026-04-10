@@ -455,7 +455,11 @@ class CastNotifier extends StateNotifier<CastState> {
           if (status == null) return;
           _pollFailures = 0;
           _position = status.position;
-          _totalDuration = status.duration;
+          // Only update duration if the TV/Chromecast reports a positive value.
+          // Otherwise keep the probed duration we pre-set.
+          if (status.duration > Duration.zero) {
+            _totalDuration = status.duration;
+          }
 
           switch (status.state) {
             case 'IDLE':
@@ -484,7 +488,12 @@ class CastNotifier extends StateNotifier<CastState> {
           final info = await _dlna.getPositionInfo(device);
           _pollFailures = 0;
           _position = info.position;
-          _totalDuration = info.duration;
+          // Only use the TV's reported duration if it's > 0.
+          // Many TVs report 0:00:00 for streams where the DIDL
+          // metadata wasn't parsed.  Keep the probed duration.
+          if (info.duration > Duration.zero) {
+            _totalDuration = info.duration;
+          }
 
           switch (info.transportState) {
             case 'STOPPED':
