@@ -94,7 +94,7 @@ class StreamProxyService {
           ..statusCode = 204
           ..headers.set('Access-Control-Allow-Origin', '*')
           ..headers.set('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS')
-          ..headers.set('Access-Control-Allow-Headers', 'Range')
+          ..headers.set('Access-Control-Allow-Headers', 'Range, Content-Type')
           ..headers.set('Access-Control-Max-Age', '86400');
         await req.response.close();
         return;
@@ -214,6 +214,7 @@ class StreamProxyService {
   Future<void> _proxyRemoteStream(HttpRequest req, String streamUrl) async {
     try {
       final parsedUrl = Uri.parse(streamUrl);
+      final isHead = req.method == 'HEAD';
 
       // Use a platform-appropriate User-Agent so CDNs don't reject requests.
       final ua = defaultTargetPlatform == TargetPlatform.iOS
@@ -239,7 +240,10 @@ class StreamProxyService {
       final range = req.headers.value('range');
       if (range != null) headers['Range'] = range;
 
-      final upstreamReq = http.Request('GET', Uri.parse(streamUrl))
+      // Use HEAD for the upstream request too when the TV sends HEAD.
+      // This avoids downloading the full body just to discard it.
+      final method = isHead ? 'HEAD' : 'GET';
+      final upstreamReq = http.Request(method, Uri.parse(streamUrl))
         ..headers.addAll(headers);
 
       final upstreamResp = await _client.send(upstreamReq)
@@ -247,7 +251,7 @@ class StreamProxyService {
 
       // ── HLS manifest? Rewrite URLs so everything goes through the proxy ──
       final ct = upstreamResp.headers['content-type'] ?? '';
-      if (_isHlsUrl(streamUrl) || _isHlsContentType(ct)) {
+      if (!isHead && (_isHlsUrl(streamUrl) || _isHlsContentType(ct))) {
         await _serveRewrittenHls(req, upstreamResp, streamUrl);
         return;
       }
@@ -278,6 +282,13 @@ class StreamProxyService {
       }
       // CORS — allows any embedded player to read the stream.
       req.response.headers.set('Access-Control-Allow-Origin', '*');
+
+      if (isHead) {
+        // HEAD — don't pipe any body, just close with headers.
+        await upstreamResp.stream.drain<void>();
+        await req.response.close();
+        return;
+      }
 
       await req.response.addStream(upstreamResp.stream);
       await req.response.close();

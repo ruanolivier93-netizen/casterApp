@@ -278,6 +278,8 @@ class CastNotifier extends StateNotifier<CastState> {
   Duration _position = Duration.zero;
   Duration _totalDuration = Duration.zero;
   int _pollFailures = 0;
+  DateTime? _castStartTime;
+  bool _hasEverPlayed = false;
 
   Duration get position => _position;
   Duration get totalDuration => _totalDuration;
@@ -338,6 +340,8 @@ class CastNotifier extends StateNotifier<CastState> {
       );
       await WakelockPlus.enable();
       await CastBackgroundService.start('Casting to ${device.name}');
+      _castStartTime = DateTime.now();
+      _hasEverPlayed = false;
       _startProgressPolling(device);
     } catch (e) {
       await _proxy.stop();
@@ -401,6 +405,8 @@ class CastNotifier extends StateNotifier<CastState> {
     await WakelockPlus.disable();
     _position = Duration.zero;
     _totalDuration = Duration.zero;
+    _castStartTime = null;
+    _hasEverPlayed = false;
     state = const CastIdle();
   }
 
@@ -412,6 +418,13 @@ class CastNotifier extends StateNotifier<CastState> {
         _progressTimer?.cancel();
         return;
       }
+
+      // Grace period: ignore STOPPED/IDLE states for the first 10 seconds
+      // after a cast starts.  Many TVs briefly report NO_MEDIA_PRESENT or
+      // STOPPED while they buffer the first few seconds.
+      final inGracePeriod = _castStartTime != null &&
+          DateTime.now().difference(_castStartTime!).inSeconds < 10;
+
       try {
         if (device.protocol == CastProtocol.chromecast) {
           final status = await _chromecast.getMediaStatus();
@@ -422,12 +435,16 @@ class CastNotifier extends StateNotifier<CastState> {
 
           switch (status.state) {
             case 'IDLE':
-              await _onNaturalStop();
+              if (!inGracePeriod && _hasEverPlayed) {
+                await _onNaturalStop();
+              }
             case 'PAUSED':
+              _hasEverPlayed = true;
               final s = state;
               if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
             case 'PLAYING':
             case 'BUFFERING':
+              _hasEverPlayed = true;
               final s = state;
               if (s is CastPlaying && s.isPaused) state = s.copyWith(isPaused: false);
           }
@@ -440,11 +457,16 @@ class CastNotifier extends StateNotifier<CastState> {
           switch (info.transportState) {
             case 'STOPPED':
             case 'NO_MEDIA_PRESENT':
-              await _onNaturalStop();
+              if (!inGracePeriod && _hasEverPlayed) {
+                await _onNaturalStop();
+              }
             case 'PAUSED_PLAYBACK':
+              _hasEverPlayed = true;
               final s = state;
               if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
             case 'PLAYING':
+            case 'TRANSITIONING':
+              _hasEverPlayed = true;
               final s = state;
               if (s is CastPlaying && s.isPaused) state = s.copyWith(isPaused: false);
           }
