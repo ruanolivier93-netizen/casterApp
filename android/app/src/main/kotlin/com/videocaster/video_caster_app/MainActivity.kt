@@ -1,17 +1,22 @@
 package com.videocaster.video_caster_app
 
 import android.content.Context
+import android.content.Intent
 import android.net.wifi.WifiManager
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import io.flutter.plugin.common.EventChannel
 
 class MainActivity : FlutterActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
+    private var shareEventSink: EventChannel.EventSink? = null
+    private var initialShareUrl: String? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
 
+        // ── Multicast lock channel ───────────────────────────────────────
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "com.videocaster/multicast"
@@ -46,6 +51,64 @@ class MainActivity : FlutterActivity() {
                 else -> result.notImplemented()
             }
         }
+
+        // ── Share intent channel ─────────────────────────────────────────
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.videocaster/share"
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "getInitialSharedUrl" -> {
+                    result.success(initialShareUrl)
+                    initialShareUrl = null
+                }
+                else -> result.notImplemented()
+            }
+        }
+
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.videocaster/share_stream"
+        ).setStreamHandler(object : EventChannel.StreamHandler {
+            override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
+                shareEventSink = events
+            }
+            override fun onCancel(arguments: Any?) {
+                shareEventSink = null
+            }
+        })
+
+        // Handle initial intent
+        handleShareIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleShareIntent(intent)
+    }
+
+    private fun handleShareIntent(intent: Intent) {
+        val url = when (intent.action) {
+            Intent.ACTION_SEND -> {
+                val text = intent.getStringExtra(Intent.EXTRA_TEXT)
+                extractUrl(text)
+            }
+            Intent.ACTION_VIEW -> intent.dataString
+            else -> null
+        }
+        if (url != null) {
+            if (shareEventSink != null) {
+                shareEventSink?.success(url)
+            } else {
+                initialShareUrl = url
+            }
+        }
+    }
+
+    private fun extractUrl(text: String?): String? {
+        if (text == null) return null
+        val regex = Regex("https?://\\S+")
+        return regex.find(text)?.value ?: if (text.startsWith("http")) text else null
     }
 
     override fun onDestroy() {

@@ -3,7 +3,6 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import '../providers/app_state.dart';
 import '../widgets/mini_player.dart';
@@ -25,17 +24,20 @@ class _MainShellState extends ConsumerState<MainShell> {
   WebViewController? _webController;
   StreamSubscription? _shareSub;
 
+  static const _shareChannel = MethodChannel('com.videocaster/share');
+  static const _shareStream = EventChannel('com.videocaster/share_stream');
+
   @override
   void initState() {
     super.initState();
     // Handle URL shared while app was closed
-    ReceiveSharingIntent.instance.getInitialMedia().then((list) {
-      _handleSharedMedia(list);
+    _shareChannel.invokeMethod<String>('getInitialSharedUrl').then((url) {
+      if (url != null) _handleSharedUrl(url);
     });
     // Handle URL shared while app is running
-    _shareSub = ReceiveSharingIntent.instance.getMediaStream().listen(
-      _handleSharedMedia,
-    );
+    _shareSub = _shareStream.receiveBroadcastStream().listen((url) {
+      if (url is String) _handleSharedUrl(url);
+    });
   }
 
   @override
@@ -44,14 +46,8 @@ class _MainShellState extends ConsumerState<MainShell> {
     super.dispose();
   }
 
-  void _handleSharedMedia(List<SharedMediaFile> files) {
-    if (files.isEmpty) return;
-    // Extract a URL from shared text
-    final text = files.first.path;
-    final urlMatch = RegExp(r'https?://\S+').firstMatch(text);
-    final url = urlMatch?.group(0) ?? text;
+  void _handleSharedUrl(String url) {
     if (url.startsWith('http://') || url.startsWith('https://')) {
-      // Navigate to Cast tab and load the URL
       setState(() => _tabIndex = 0);
       ref.read(browserCastUrlProvider.notifier).state = url;
       ref.read(videoProvider.notifier).extract(url);
