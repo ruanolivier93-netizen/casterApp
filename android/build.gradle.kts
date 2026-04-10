@@ -19,15 +19,13 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
-// Force all plugins to compile with JVM 17 (matches app target).
+// Force all plugins to use JVM 17 via Kotlin JVM Toolchain.
+// This sets BOTH Java and Kotlin targets, avoiding the mismatch error
+// from plugins like receive_sharing_intent that default to JVM 1.8.
 subprojects {
-    tasks.withType<JavaCompile>().configureEach {
-        sourceCompatibility = "17"
-        targetCompatibility = "17"
-    }
-    tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
-        compilerOptions {
-            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+    plugins.withId("org.jetbrains.kotlin.android") {
+        extensions.configure<org.jetbrains.kotlin.gradle.dsl.KotlinAndroidProjectExtension> {
+            jvmToolchain(17)
         }
     }
 }
