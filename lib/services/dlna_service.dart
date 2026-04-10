@@ -247,10 +247,11 @@ class DlnaService {
     String? subtitleUrl,
     int? durationSeconds,
     String? contentType,
+    int? fileSize,
   }) async {
     final metadata = _buildDIDL(title, uri,
         subtitleUrl: subtitleUrl, durationSeconds: durationSeconds,
-        contentType: contentType);
+        contentType: contentType, fileSize: fileSize);
     await _soap(
       device.controlUrl,
       'SetAVTransportURI',
@@ -373,18 +374,22 @@ class DlnaService {
     String? subtitleUrl,
     int? durationSeconds,
     String? contentType,
+    int? fileSize,
   }) {
     final mime = contentType ?? _mimeType(uri);
     final isAudio = mime.startsWith('audio/');
     final upnpClass = isAudio ? 'object.item.audioItem.musicTrack' : 'object.item.videoItem';
 
-    // Build the <res> attribute string with optional duration.
-    final resBuf = StringBuffer('protocolInfo="http-get:*:$mime:*"');
+    // Build the <res> attribute string with optional duration and size.
+    final resBuf = StringBuffer('protocolInfo="http-get:*:$mime:DLNA.ORG_OP=01;DLNA.ORG_FLAGS=01700000000000000000000000000000"');
     if (durationSeconds != null && durationSeconds > 0) {
       final h = (durationSeconds ~/ 3600).toString().padLeft(2, '0');
       final m = ((durationSeconds % 3600) ~/ 60).toString().padLeft(2, '0');
       final s = (durationSeconds % 60).toString().padLeft(2, '0');
       resBuf.write(' duration="$h:$m:$s"');
+    }
+    if (fileSize != null && fileSize > 0) {
+      resBuf.write(' size="$fileSize"');
     }
 
     // Samsung-style <sec:CaptionInfoEx> for subtitles — most widely supported.

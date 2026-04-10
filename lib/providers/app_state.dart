@@ -317,6 +317,15 @@ class CastNotifier extends StateNotifier<CastState> {
         castUrl = format.url;
       }
 
+      // Use probed duration/size from the proxy if the caller didn't provide them.
+      final effectiveDuration = durationSeconds ?? _proxy.probedDurationSeconds;
+      final fileSize = _proxy.probedContentLength;
+
+      // Pre-set total duration so the app's seekbar works from the start.
+      if (effectiveDuration != null && effectiveDuration > 0) {
+        _totalDuration = Duration(seconds: effectiveDuration);
+      }
+
       if (device.protocol == CastProtocol.chromecast) {
         // ── Chromecast flow ──
         await _chromecast.connect(device);
@@ -329,8 +338,8 @@ class CastNotifier extends StateNotifier<CastState> {
       } else {
         // ── DLNA flow ──
         await _dlna.setUri(device, castUrl, title,
-            subtitleUrl: subtitleUrl, durationSeconds: durationSeconds,
-            contentType: contentType);
+            subtitleUrl: subtitleUrl, durationSeconds: effectiveDuration,
+            contentType: contentType, fileSize: fileSize);
         await _dlna.play(device);
       }
 

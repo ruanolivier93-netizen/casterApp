@@ -27,7 +27,19 @@ class StreamProxyService {
   // previous casts that can cause immediate "connection lost" on the TV.
   http.Client? _client;
 
+  /// Probed total file size (bytes) from HEAD request or HLS manifest.
+  int? _probedContentLength;
+
+  /// Probed total duration (seconds) from HLS manifest parsing.
+  int? _probedDurationSeconds;
+
   bool get isRunning => _server != null;
+
+  /// Total file size in bytes (probed at start). Null for HLS/unknown.
+  int? get probedContentLength => _probedContentLength;
+
+  /// Duration in seconds (probed from HLS manifest or upstream headers).
+  int? get probedDurationSeconds => _probedDurationSeconds;
 
   /// The MIME type of the original stream (before proxying).
   /// Used to build correct DLNA DIDL metadata.
@@ -78,6 +90,12 @@ class StreamProxyService {
     final port = _server!.port;
     _baseUrl = 'http://$ip:$port';
     _serve();
+
+    // Probe the upstream stream to learn Content-Length and/or duration.
+    // This info is used by DIDL metadata so the TV shows a proper
+    // progress bar and enables seeking via the TV remote.
+    await _probeStream(streamUrl);
+
     return _baseUrl;
   }
 
@@ -89,6 +107,80 @@ class StreamProxyService {
   String? get subtitleEndpoint => _subtitleSrt != null && _server != null
       ? 'http://${_server!.address.host}:${_server!.port}/subtitle.srt'
       : null;
+
+  /// Probes the upstream stream to learn Content-Length and duration.
+  /// For HLS, fetches the manifest and sums `#EXTINF:` tags.
+  /// For direct streams, does a HEAD request to get Content-Length.
+  Future<void> _probeStream(String streamUrl) async {
+    _probedContentLength = null;
+    _probedDurationSeconds = null;
+    try {
+      final parsedUrl = Uri.parse(streamUrl);
+      final ua = defaultTargetPlatform == TargetPlatform.iOS
+          ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) '
+              'AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1'
+          : 'Mozilla/5.0 (Linux; Android 14; Pixel 8) '
+              'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
+
+      final headers = <String, String>{
+        'User-Agent': ua,
+        'Accept': '*/*',
+        'Origin': _originHost ?? '${parsedUrl.scheme}://${parsedUrl.host}',
+        'Referer': _originHost != null ? '$_originHost/' : '${parsedUrl.scheme}://${parsedUrl.host}/',
+        ..._extraHeaders,
+      };
+
+      if (_isHlsUrl(streamUrl)) {
+        // HLS — fetch manifest and calculate total duration from #EXTINF tags
+        final req = http.Request('GET', Uri.parse(streamUrl))
+          ..headers.addAll(headers);
+        final resp = await _client!.send(req).timeout(const Duration(seconds: 15));
+        final body = await resp.stream.bytesToString();
+        double totalDuration = 0;
+        final extinfRegex = RegExp(r'#EXTINF:\s*([\d.]+)');
+        for (final match in extinfRegex.allMatches(body)) {
+          totalDuration += double.parse(match.group(1)!);
+        }
+        if (totalDuration > 0) {
+          _probedDurationSeconds = totalDuration.round();
+        }
+        // If it's a master playlist (has stream variants), try fetching
+        // the first variant to get segment durations.
+        if (_probedDurationSeconds == null || _probedDurationSeconds == 0) {
+          final variantRegex = RegExp(r'#EXT-X-STREAM-INF:.*\n(.+)');
+          final variantMatch = variantRegex.firstMatch(body);
+          if (variantMatch != null) {
+            final variantUrl = Uri.parse(streamUrl).resolve(variantMatch.group(1)!.trim()).toString();
+            try {
+              final vReq = http.Request('GET', Uri.parse(variantUrl))
+                ..headers.addAll(headers);
+              final vResp = await _client!.send(vReq).timeout(const Duration(seconds: 15));
+              final vBody = await vResp.stream.bytesToString();
+              double vDuration = 0;
+              for (final m in extinfRegex.allMatches(vBody)) {
+                vDuration += double.parse(m.group(1)!);
+              }
+              if (vDuration > 0) {
+                _probedDurationSeconds = vDuration.round();
+              }
+            } catch (_) {}
+          }
+        }
+      } else {
+        // Direct stream — HEAD request to get Content-Length
+        final req = http.Request('HEAD', Uri.parse(streamUrl))
+          ..headers.addAll(headers);
+        final resp = await _client!.send(req).timeout(const Duration(seconds: 15));
+        await resp.stream.drain<void>();
+        final cl = resp.headers['content-length'];
+        if (cl != null) {
+          _probedContentLength = int.tryParse(cl);
+        }
+      }
+    } catch (_) {
+      // Probing is best-effort — don't block the cast if it fails.
+    }
+  }
 
   void _serve() {
     _server?.listen((req) async {
@@ -443,6 +535,8 @@ class StreamProxyService {
     _extraHeaders = {};
     _subtitleSrt = null;
     _originalMimeType = null;
+    _probedContentLength = null;
+    _probedDurationSeconds = null;
     _client?.close();
     _client = null;
   }
