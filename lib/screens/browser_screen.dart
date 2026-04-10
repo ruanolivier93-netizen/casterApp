@@ -1,9 +1,12 @@
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../services/ad_blocker.dart';
+import '../providers/bookmarks_history.dart';
+import '../providers/app_state.dart';
 
 /// Callback when user taps "Cast" on a detected video URL.
 typedef OnCastUrl = void Function(String url);
@@ -59,15 +62,16 @@ class _DetectedVideo {
 
 // ── Browser Screen ──────────────────────────────────────────────────────────
 
-class BrowserScreen extends StatefulWidget {
+class BrowserScreen extends ConsumerStatefulWidget {
   final OnCastUrl onCastUrl;
-  const BrowserScreen({super.key, required this.onCastUrl});
+  final ValueChanged<WebViewController>? onControllerCreated;
+  const BrowserScreen({super.key, required this.onCastUrl, this.onControllerCreated});
 
   @override
-  State<BrowserScreen> createState() => _BrowserScreenState();
+  ConsumerState<BrowserScreen> createState() => _BrowserScreenState();
 }
 
-class _BrowserScreenState extends State<BrowserScreen>
+class _BrowserScreenState extends ConsumerState<BrowserScreen>
     with AutomaticKeepAliveClientMixin {
   late final WebViewController _controller;
   final _urlController = TextEditingController();
@@ -132,9 +136,13 @@ class _BrowserScreenState extends State<BrowserScreen>
           });
           _controller.runJavaScript(AdBlocker.jsScript);
           _controller.runJavaScript(AdBlocker.videoDetectorScript);
+          // Record in browsing history
+          final title = await _controller.getTitle() ?? url;
+          ref.read(historyProvider.notifier).add(url, title);
         },
       ))
       ..loadRequest(Uri.parse('https://www.google.com'));
+    widget.onControllerCreated?.call(_controller);
     _urlController.text = 'https://www.google.com';
   }
 
@@ -308,88 +316,84 @@ class _BrowserScreenState extends State<BrowserScreen>
       shape: const RoundedRectangleBorder(
         borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
       ),
-      builder: (ctx) => DraggableScrollableSheet(
-        initialChildSize: 0.45,
-        minChildSize: 0.3,
-        maxChildSize: 0.85,
-        expand: false,
-        builder: (_, scrollController) => Padding(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Drag handle
-              Center(
-                child: Container(
-                  width: 40, height: 4,
-                  margin: const EdgeInsets.only(bottom: 12),
-                  decoration: BoxDecoration(
-                    color: cs.onSurfaceVariant.withAlpha(80),
-                    borderRadius: BorderRadius.circular(2),
-                  ),
-                ),
-              ),
-              Row(children: [
-                Icon(Icons.cast, color: cs.primary, size: 22),
-                const SizedBox(width: 8),
-                Text(
-                  'Cast a video',
-                  style: Theme.of(ctx).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
-                ),
-                const Spacer(),
-                Text(
-                  '${items.length} found',
-                  style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                ),
-              ]),
-              const SizedBox(height: 4),
-              Text(
-                'Tap a video to send it to the Cast tab for TV selection.',
-                style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-              ),
-              const SizedBox(height: 12),
-              Expanded(
-                child: ListView.separated(
-                  controller: scrollController,
-                  itemCount: items.length,
-                  separatorBuilder: (_, __) => const Divider(height: 1),
-                  itemBuilder: (_, i) {
-                    final v = items[i];
-                    final label = v.type == 'page' ? 'This page' : _videoLabel(v.url);
-                    final typeText = v.type == 'page' ? 'YouTube page' : _typeLabel(v.type);
-                    return ListTile(
-                      contentPadding: const EdgeInsets.symmetric(vertical: 4),
-                      leading: CircleAvatar(
-                        backgroundColor: cs.primaryContainer,
-                        child: Icon(_typeIcon(v.type), color: cs.primary, size: 20),
-                      ),
-                      title: Text(label,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
-                      subtitle: Text(typeText,
-                          style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-                      trailing: FilledButton.icon(
-                        icon: const Icon(Icons.cast, size: 16),
-                        label: const Text('Cast'),
-                        style: FilledButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                          textStyle: const TextStyle(fontSize: 12),
+      builder: (ctx) {
+        final maxH = MediaQuery.of(ctx).size.height * 0.7;
+        return ConstrainedBox(
+          constraints: BoxConstraints(maxHeight: maxH),
+          child: ListView.builder(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+            shrinkWrap: true,
+            itemCount: items.length + 1, // +1 for header
+            itemBuilder: (_, i) {
+              if (i == 0) {
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Center(
+                      child: Container(
+                        width: 40, height: 4,
+                        margin: const EdgeInsets.only(bottom: 12),
+                        decoration: BoxDecoration(
+                          color: cs.onSurfaceVariant.withAlpha(80),
+                          borderRadius: BorderRadius.circular(2),
                         ),
-                        onPressed: () {
-                          Navigator.pop(ctx);
-                          widget.onCastUrl(_normalizeForCast(v.url));
-                        },
                       ),
-                    );
+                    ),
+                    Row(children: [
+                      Icon(Icons.cast, color: cs.primary, size: 22),
+                      const SizedBox(width: 8),
+                      Text(
+                        'Cast a video',
+                        style: Theme.of(ctx).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                      const Spacer(),
+                      Text(
+                        '${items.length} found',
+                        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                      ),
+                    ]),
+                    const SizedBox(height: 4),
+                    Text(
+                      'Tap a video to send it to the Cast tab for TV selection.',
+                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+                    ),
+                    const SizedBox(height: 8),
+                    const Divider(height: 1),
+                  ],
+                );
+              }
+              final v = items[i - 1];
+              final label = v.type == 'page' ? 'This page' : _videoLabel(v.url);
+              final typeText = v.type == 'page' ? 'YouTube page' : _typeLabel(v.type);
+              return ListTile(
+                contentPadding: const EdgeInsets.symmetric(vertical: 4),
+                leading: CircleAvatar(
+                  backgroundColor: cs.primaryContainer,
+                  child: Icon(_typeIcon(v.type), color: cs.primary, size: 20),
+                ),
+                title: Text(label,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
+                subtitle: Text(typeText,
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                trailing: FilledButton.icon(
+                  icon: const Icon(Icons.cast, size: 16),
+                  label: const Text('Cast'),
+                  style: FilledButton.styleFrom(
+                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                    textStyle: const TextStyle(fontSize: 12),
+                  ),
+                  onPressed: () {
+                    Navigator.pop(ctx);
+                    widget.onCastUrl(_normalizeForCast(v.url));
                   },
                 ),
-              ),
-            ],
+              );
+            },
           ),
-        ),
-      ),
+        );
+      },
     );
   }
 
@@ -450,18 +454,61 @@ class _BrowserScreenState extends State<BrowserScreen>
   }
 
   Widget _buildBookmarksGrid(ColorScheme cs) {
+    final userBookmarks = ref.watch(bookmarksProvider);
+
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
-      child: Wrap(
-        spacing: 8,
-        runSpacing: 6,
-        children: _bookmarks
-            .map((b) => ActionChip(
-                  avatar: Icon(b.icon, size: 16),
-                  label: Text(b.label, style: const TextStyle(fontSize: 12)),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // User-saved bookmarks
+          if (userBookmarks.isNotEmpty) ...[
+            Row(
+              children: [
+                Text('Bookmarks',
+                    style: TextStyle(
+                        fontWeight: FontWeight.w600,
+                        fontSize: 12,
+                        color: cs.onSurfaceVariant)),
+                const Spacer(),
+                TextButton(
+                  onPressed: () => ref.read(bookmarksProvider.notifier).clear(),
+                  child: const Text('Clear', style: TextStyle(fontSize: 10)),
+                ),
+              ],
+            ),
+            Wrap(
+              spacing: 8,
+              runSpacing: 6,
+              children: userBookmarks.take(8).map((b) {
+                final host = Uri.tryParse(b.url)?.host ?? '';
+                return ActionChip(
+                  avatar: const Icon(Icons.bookmark, size: 14),
+                  label: Text(
+                    b.title.isNotEmpty
+                        ? (b.title.length > 15 ? '${b.title.substring(0, 15)}…' : b.title)
+                        : host,
+                    style: const TextStyle(fontSize: 11),
+                  ),
                   onPressed: () => _controller.loadRequest(Uri.parse(b.url)),
-                ))
-            .toList(),
+                );
+              }).toList(),
+            ),
+            const SizedBox(height: 8),
+          ],
+          // Quick-access sites
+          Wrap(
+            spacing: 8,
+            runSpacing: 6,
+            children: _bookmarks
+                .map((b) => ActionChip(
+                      avatar: Icon(b.icon, size: 16),
+                      label: Text(b.label, style: const TextStyle(fontSize: 12)),
+                      onPressed: () => _controller.loadRequest(Uri.parse(b.url)),
+                    ))
+                .toList(),
+          ),
+        ],
       ),
     );
   }
@@ -496,9 +543,13 @@ class _BrowserScreenState extends State<BrowserScreen>
   }
 
   Widget _buildNavRow(ColorScheme cs) {
+    final bookmarks = ref.watch(bookmarksProvider);
+    final isBookmarked = _currentUrl.isNotEmpty &&
+        bookmarks.any((b) => b.url == _currentUrl);
+
     return SafeArea(
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
           children: [
@@ -520,10 +571,205 @@ class _BrowserScreenState extends State<BrowserScreen>
                 _controller.loadRequest(Uri.parse('https://www.google.com'));
               },
             ),
+            IconButton(
+              icon: Icon(
+                isBookmarked ? Icons.bookmark : Icons.bookmark_border,
+                size: 20,
+                color: isBookmarked ? cs.primary : null,
+              ),
+              tooltip: isBookmarked ? 'Remove bookmark' : 'Bookmark this page',
+              onPressed: () {
+                if (_currentUrl.isEmpty) return;
+                if (isBookmarked) {
+                  ref.read(bookmarksProvider.notifier).remove(_currentUrl);
+                } else {
+                  ref.read(bookmarksProvider.notifier).add(
+                        _currentUrl,
+                        _urlController.text,
+                      );
+                }
+              },
+            ),
+            IconButton(
+              icon: const Icon(Icons.history, size: 20),
+              tooltip: 'History',
+              onPressed: _showHistorySheet,
+            ),
+            if (_detectedVideos.isNotEmpty)
+              IconButton(
+                icon: Icon(Icons.download, size: 20, color: cs.primary),
+                tooltip: 'Download video',
+                onPressed: _showDownloadPicker,
+              ),
           ],
         ),
       ),
     );
+  }
+
+  void _showHistorySheet() {
+    final history = ref.read(historyProvider);
+    final cs = Theme.of(context).colorScheme;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return DraggableScrollableSheet(
+          expand: false,
+          initialChildSize: 0.6,
+          minChildSize: 0.3,
+          maxChildSize: 0.9,
+          builder: (_, scrollCtrl) {
+            return Column(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                  child: Row(
+                    children: [
+                      Icon(Icons.history, color: cs.primary, size: 22),
+                      const SizedBox(width: 8),
+                      Text('Browsing History',
+                          style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                              fontWeight: FontWeight.w600)),
+                      const Spacer(),
+                      TextButton(
+                        onPressed: () {
+                          ref.read(historyProvider.notifier).clear();
+                          Navigator.pop(ctx);
+                        },
+                        child: const Text('Clear all', style: TextStyle(fontSize: 12)),
+                      ),
+                    ],
+                  ),
+                ),
+                const Divider(height: 1),
+                Expanded(
+                  child: history.isEmpty
+                      ? Center(
+                          child: Text('No browsing history yet',
+                              style: TextStyle(color: cs.onSurfaceVariant)))
+                      : ListView.builder(
+                          controller: scrollCtrl,
+                          itemCount: history.length,
+                          itemBuilder: (_, i) {
+                            final entry = history[i];
+                            return ListTile(
+                              dense: true,
+                              leading: const Icon(Icons.language, size: 18),
+                              title: Text(entry.title.isNotEmpty ? entry.title : entry.url,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(fontSize: 13)),
+                              subtitle: Text(entry.url,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                      fontSize: 11, color: cs.onSurfaceVariant)),
+                              onTap: () {
+                                Navigator.pop(ctx);
+                                _controller.loadRequest(Uri.parse(entry.url));
+                              },
+                              trailing: IconButton(
+                                icon: const Icon(Icons.close, size: 16),
+                                onPressed: () {
+                                  ref.read(historyProvider.notifier).removeEntry(entry.url);
+                                },
+                              ),
+                            );
+                          },
+                        ),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+  }
+
+  void _showDownloadPicker() {
+    final cs = Theme.of(context).colorScheme;
+    final sorted = List<_DetectedVideo>.from(_detectedVideos)
+      ..sort((a, b) => a.priority.compareTo(b.priority));
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40, height: 4,
+                  margin: const EdgeInsets.only(bottom: 12),
+                  decoration: BoxDecoration(
+                    color: cs.onSurfaceVariant.withAlpha(80),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              Row(
+                children: [
+                  Icon(Icons.download, color: cs.primary),
+                  const SizedBox(width: 8),
+                  Text('Download Video',
+                      style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w600)),
+                ],
+              ),
+              const SizedBox(height: 8),
+              ...sorted.take(10).map((v) => ListTile(
+                    contentPadding: EdgeInsets.zero,
+                    dense: true,
+                    leading: Icon(_typeIcon(v.type), color: cs.primary, size: 20),
+                    title: Text(_videoLabel(v.url),
+                        maxLines: 1, overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13)),
+                    subtitle: Text(_typeLabel(v.type),
+                        style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                    trailing: IconButton(
+                      icon: Icon(Icons.download, color: cs.primary),
+                      onPressed: () {
+                        Navigator.pop(ctx);
+                        ref.read(downloadServiceProvider).download(
+                          url: v.url,
+                          filename: _filenameFromUrl(v.url),
+                        );
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                            content: Text('Download started — check Files tab'),
+                            duration: Duration(seconds: 2),
+                          ),
+                        );
+                      },
+                    ),
+                  )),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  String _filenameFromUrl(String url) {
+    try {
+      final uri = Uri.parse(url);
+      final last = uri.pathSegments.isNotEmpty ? uri.pathSegments.last : 'video';
+      final name = Uri.decodeComponent(last.split('?').first);
+      if (name.contains('.')) return name;
+      return '$name.mp4';
+    } catch (_) {
+      return 'video_${DateTime.now().millisecondsSinceEpoch}.mp4';
+    }
   }
 }
 

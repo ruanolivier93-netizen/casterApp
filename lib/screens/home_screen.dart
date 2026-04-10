@@ -2,6 +2,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:cached_network_image/cached_network_image.dart';
 import '../providers/app_state.dart';
+import '../providers/queue_provider.dart';
+import '../services/subtitle_service.dart';
 import '../models/video_info.dart';
 import '../models/dlna_device.dart';
 
@@ -15,7 +17,6 @@ class HomeScreen extends ConsumerStatefulWidget {
 class _HomeScreenState extends ConsumerState<HomeScreen> {
   final _urlController = TextEditingController();
   final _scroll = ScrollController();
-  bool _autoScanned = false;
 
   @override
   void dispose() {
@@ -40,7 +41,6 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     ref.read(selectedDeviceProvider.notifier).state = null;
     ref.read(selectedSubtitleProvider.notifier).state = null;
     ref.read(videoProvider.notifier).extract(url);
-    _autoScanned = false;
     FocusScope.of(context).unfocus();
   }
 
@@ -54,16 +54,15 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
     final isCasting = castState is CastPlaying;
     final cs = Theme.of(context).colorScheme;
 
-    // Auto-scan for TVs when video loads (only once per extract).
-    if (videoState is VideoLoaded && !_autoScanned) {
-      _autoScanned = true;
-      WidgetsBinding.instance.addPostFrameCallback((_) {
+    // Auto-scan for TVs whenever a new video loads.
+    ref.listen<VideoState>(videoProvider, (prev, next) {
+      if (next is VideoLoaded && prev is! VideoLoaded) {
         final ds = ref.read(devicesProvider);
         if (ds is! DevicesScanning) {
           ref.read(devicesProvider.notifier).scan();
         }
-      });
-    }
+      }
+    });
 
     // Auto-fill URL from browser cast button.
     final browserUrl = ref.watch(browserCastUrlProvider);
@@ -138,6 +137,16 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
           if (isCasting || castState is CastPreparing || castState is CastError) ...[
             const SizedBox(height: 12),
             _CastControls(videoState: videoState),
+          ],
+
+          // ── Queue ───────────────────────────────────────────────────────
+          const SizedBox(height: 12),
+          const _QueueSection(),
+
+          // ── Subtitle Search ─────────────────────────────────────────────
+          if (videoState is VideoLoaded) ...[
+            const SizedBox(height: 12),
+            _SubtitleSearchSection(title: videoState.info.title),
           ],
         ],
       ),
@@ -958,6 +967,205 @@ class _RouteToggleBar extends ConsumerWidget {
   }
 }
 
+// ── Queue Section ───────────────────────────────────────────────────────────
+
+class _QueueSection extends ConsumerWidget {
+  const _QueueSection();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final queue = ref.watch(queueProvider);
+    if (queue.isEmpty) return const SizedBox.shrink();
+    final cs = Theme.of(context).colorScheme;
+    final notifier = ref.read(queueProvider.notifier);
+    final currentIdx = notifier.currentIndex;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.queue_music, size: 18, color: cs.onSurfaceVariant),
+            const SizedBox(width: 6),
+            Text('Queue (${queue.length})',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                    color: cs.onSurfaceVariant)),
+            const Spacer(),
+            TextButton(
+              onPressed: () => ref.read(queueProvider.notifier).clear(),
+              child: const Text('Clear', style: TextStyle(fontSize: 12)),
+            ),
+          ],
+        ),
+        const SizedBox(height: 4),
+        ...List.generate(queue.length, (i) {
+          final item = queue[i];
+          final isCurrent = i == currentIdx;
+          return Dismissible(
+            key: ValueKey('${item.url}_$i'),
+            direction: DismissDirection.endToStart,
+            background: Container(
+              alignment: Alignment.centerRight,
+              padding: const EdgeInsets.only(right: 16),
+              color: cs.error,
+              child: const Icon(Icons.delete, color: Colors.white),
+            ),
+            onDismissed: (_) => notifier.removeAt(i),
+            child: ListTile(
+              dense: true,
+              contentPadding: const EdgeInsets.symmetric(horizontal: 4),
+              leading: isCurrent
+                  ? Icon(Icons.play_arrow, color: cs.primary, size: 20)
+                  : Text('${i + 1}',
+                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+              title: Text(item.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: isCurrent ? FontWeight.w600 : FontWeight.normal)),
+              trailing: IconButton(
+                icon: const Icon(Icons.cast, size: 16),
+                tooltip: 'Cast this',
+                onPressed: () {
+                  notifier.setCurrent(i);
+                  ref.read(videoProvider.notifier).extract(item.url);
+                },
+              ),
+            ),
+          );
+        }),
+      ],
+    );
+  }
+}
+
+// ── Subtitle Search Section ─────────────────────────────────────────────────
+
+class _SubtitleSearchSection extends ConsumerStatefulWidget {
+  final String title;
+  const _SubtitleSearchSection({required this.title});
+
+  @override
+  ConsumerState<_SubtitleSearchSection> createState() =>
+      _SubtitleSearchSectionState();
+}
+
+class _SubtitleSearchSectionState
+    extends ConsumerState<_SubtitleSearchSection> {
+  List<SubtitleResult>? _results;
+  bool _loading = false;
+  String? _error;
+
+  Future<void> _search() async {
+    setState(() {
+      _loading = true;
+      _error = null;
+    });
+    try {
+      final service = ref.read(subtitleServiceProvider);
+      final results = await service.search(query: widget.title);
+      if (mounted) setState(() => _results = results);
+    } catch (e) {
+      if (mounted) setState(() => _error = e.toString());
+    } finally {
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _downloadAndApply(SubtitleResult sub) async {
+    try {
+      final service = ref.read(subtitleServiceProvider);
+      final srt = await service.download(sub.fileId);
+      if (srt != null && mounted) {
+        ref.read(selectedSubtitleProvider.notifier).state = SubtitleTrack(
+          language: sub.language,
+          label: '${sub.language} (OpenSubtitles)',
+          srtContent: srt,
+        );
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Subtitles loaded: ${sub.language}'),
+              duration: const Duration(seconds: 2),
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Failed to download subtitle: $e')),
+        );
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.subtitles, size: 18, color: cs.onSurfaceVariant),
+            const SizedBox(width: 6),
+            Text('Search Subtitles',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 13,
+                    color: cs.onSurfaceVariant)),
+            const Spacer(),
+            if (_loading)
+              const SizedBox(
+                width: 16, height: 16,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            else
+              TextButton.icon(
+                icon: const Icon(Icons.search, size: 14),
+                label: const Text('Search', style: TextStyle(fontSize: 12)),
+                onPressed: _search,
+              ),
+          ],
+        ),
+        if (_error != null) ...[
+          const SizedBox(height: 4),
+          Text(_error!, style: TextStyle(fontSize: 12, color: cs.error)),
+        ],
+        if (_results != null && _results!.isEmpty) ...[
+          const SizedBox(height: 4),
+          Text('No subtitles found',
+              style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+        ],
+        if (_results != null && _results!.isNotEmpty) ...[
+          const SizedBox(height: 4),
+          ...(_results!.take(8).map((sub) => ListTile(
+                dense: true,
+                contentPadding: EdgeInsets.zero,
+                leading: Icon(Icons.subtitles_outlined,
+                    size: 18, color: cs.onSurfaceVariant),
+                title: Text(sub.filename,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(fontSize: 12)),
+                subtitle: Text('${sub.language} · ${sub.downloadCount} downloads',
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                trailing: IconButton(
+                  icon: Icon(Icons.download, size: 16, color: cs.primary),
+                  onPressed: () => _downloadAndApply(sub),
+                ),
+              ))),
+        ],
+      ],
+    );
+  }
+}
+
 // ── Settings Sheet ──────────────────────────────────────────────────────────
 
 class _SettingsSheet extends ConsumerWidget {
@@ -993,7 +1201,7 @@ class _SettingsSheet extends ConsumerWidget {
             subtitle: const Text(
               'YouTube (full quality picker)\n'
               'Direct video URLs (.mp4, .m3u8, .webm, .mkv)\n'
-              'Any DLNA/UPnP-compatible TV or renderer',
+              'DLNA/UPnP TVs & Chromecast devices',
             ),
             isThreeLine: true,
           ),

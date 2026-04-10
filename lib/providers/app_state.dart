@@ -8,12 +8,18 @@ import '../models/dlna_device.dart';
 import '../services/video_extractor.dart';
 import '../services/dlna_service.dart';
 import '../services/stream_proxy.dart';
+import '../services/chromecast_service.dart';
+import '../services/subtitle_service.dart';
+import '../services/download_service.dart';
 
-// ── Singleton services ────────────────────────────────────────────────────────
+// ── Singleton services ────────────────────────────────────────────────────────────────────
 
 final videoExtractorProvider = Provider((_) => VideoExtractorService());
 final dlnaServiceProvider = Provider((_) => DlnaService());
+final chromecastServiceProvider = Provider((_) => ChromecastService());
 final streamProxyProvider = Provider((_) => StreamProxyService());
+final subtitleServiceProvider = Provider((_) => SubtitleService());
+final downloadServiceProvider = Provider((_) => DownloadService());
 
 // ── Settings ──────────────────────────────────────────────────────────────────
 
@@ -89,6 +95,32 @@ class VideoNotifier extends StateNotifier<VideoState> {
     }
   }
 
+  /// Creates a VideoLoaded state directly for known video URLs
+  /// (e.g., browser-detected direct streams) without network calls.
+  void loadDirect(String url, {String? title}) {
+    final uri = Uri.tryParse(url);
+    final raw = uri != null && uri.pathSegments.isNotEmpty
+        ? Uri.decodeComponent(uri.pathSegments.last.split('?').first)
+        : '';
+    final filename = raw.isNotEmpty ? raw : 'Direct Stream';
+
+    state = VideoLoaded(
+      VideoInfo(
+        title: title ?? filename,
+        formats: [
+          StreamFormat(
+            id: 'direct',
+            label: 'Direct stream',
+            url: url,
+            height: 0,
+            hasAudio: true,
+          ),
+        ],
+      ),
+      url,
+    );
+  }
+
   void reset() => state = const VideoIdle();
 }
 
@@ -123,20 +155,44 @@ class DevicesError extends DevicesState {
 }
 
 class DevicesNotifier extends StateNotifier<DevicesState> {
-  DevicesNotifier(this._dlna) : super(const DevicesIdle());
+  DevicesNotifier(this._dlna, this._chromecast) : super(const DevicesIdle());
   final DlnaService _dlna;
+  final ChromecastService _chromecast;
 
-  /// Stream-based scan: devices appear in UI as they're discovered.
+  /// Stream-based scan: DLNA + Chromecast in parallel, devices appear live.
   Future<void> scan() async {
     state = const DevicesScanning();
     try {
       final found = <DlnaDevice>[];
-      await for (final device in _dlna.discoverStream()) {
+      final seen = <String>{};
+
+      void addDevice(DlnaDevice device) {
+        if (seen.contains(device.location)) return;
+        seen.add(device.location);
         found.add(device);
         if (mounted) {
           state = DevicesScanning(devicesFoundSoFar: List.unmodifiable(found));
         }
       }
+
+      // Run DLNA and Chromecast discovery in parallel
+      await Future.wait([
+        (() async {
+          await for (final device in _dlna.discoverStream()) {
+            addDevice(device);
+          }
+        })(),
+        (() async {
+          try {
+            await for (final device in _chromecast.discover()) {
+              addDevice(device);
+            }
+          } catch (_) {
+            // mDNS may fail on some networks — don't block DLNA results
+          }
+        })(),
+      ]);
+
       state = DevicesResult(found);
     } catch (e) {
       state = DevicesError(_clean(e));
@@ -145,7 +201,10 @@ class DevicesNotifier extends StateNotifier<DevicesState> {
 }
 
 final devicesProvider = StateNotifierProvider<DevicesNotifier, DevicesState>(
-  (ref) => DevicesNotifier(ref.watch(dlnaServiceProvider)),
+  (ref) => DevicesNotifier(
+    ref.watch(dlnaServiceProvider),
+    ref.watch(chromecastServiceProvider),
+  ),
 );
 
 // ── Cast state ────────────────────────────────────────────────────────────────
@@ -189,8 +248,9 @@ class CastError extends CastState {
 }
 
 class CastNotifier extends StateNotifier<CastState> {
-  CastNotifier(this._dlna, this._proxy) : super(const CastIdle());
+  CastNotifier(this._dlna, this._chromecast, this._proxy) : super(const CastIdle());
   final DlnaService _dlna;
+  final ChromecastService _chromecast;
   final StreamProxyService _proxy;
 
   Timer? _progressTimer;
@@ -228,20 +288,33 @@ class CastNotifier extends StateNotifier<CastState> {
         castUrl = format.url;
       }
 
-      await _dlna.setUri(device, castUrl, title,
-          subtitleUrl: subtitleUrl, durationSeconds: durationSeconds);
-      await _dlna.play(device);
+      if (device.protocol == CastProtocol.chromecast) {
+        // ── Chromecast flow ──
+        await _chromecast.connect(device);
+        await _chromecast.loadMedia(
+          url: castUrl,
+          title: title,
+          subtitleUrl: subtitleUrl,
+        );
+      } else {
+        // ── DLNA flow ──
+        await _dlna.setUri(device, castUrl, title,
+            subtitleUrl: subtitleUrl, durationSeconds: durationSeconds);
+        await _dlna.play(device);
+      }
 
       state = CastPlaying(
         device: device,
         title: title,
         routedThroughPhone: routeThroughPhone,
       );
-      // Keep the screen on while casting.
       await WakelockPlus.enable();
       _startProgressPolling(device);
     } catch (e) {
       await _proxy.stop();
+      if (device.protocol == CastProtocol.chromecast) {
+        await _chromecast.disconnect();
+      }
       state = CastError(_clean(e));
     }
   }
@@ -250,12 +323,19 @@ class CastNotifier extends StateNotifier<CastState> {
     final s = state;
     if (s is! CastPlaying) return;
     try {
-      if (s.isPaused) {
-        await _dlna.play(s.device);
+      if (s.device.protocol == CastProtocol.chromecast) {
+        if (s.isPaused) {
+          await _chromecast.play();
+        } else {
+          await _chromecast.pause();
+        }
       } else {
-        await _dlna.pause(s.device);
+        if (s.isPaused) {
+          await _dlna.play(s.device);
+        } else {
+          await _dlna.pause(s.device);
+        }
       }
-      // Create a new immutable state — Riverpod detects the change correctly.
       state = s.copyWith(isPaused: !s.isPaused);
     } catch (_) {}
   }
@@ -264,7 +344,11 @@ class CastNotifier extends StateNotifier<CastState> {
     final s = state;
     if (s is! CastPlaying) return;
     try {
-      await _dlna.seek(s.device, position);
+      if (s.device.protocol == CastProtocol.chromecast) {
+        await _chromecast.seek(position);
+      } else {
+        await _dlna.seek(s.device, position);
+      }
       _position = position;
     } catch (_) {}
   }
@@ -274,7 +358,14 @@ class CastNotifier extends StateNotifier<CastState> {
     _pollFailures = 0;
     final s = state;
     if (s is CastPlaying) {
-      try { await _dlna.stop(s.device); } catch (_) {}
+      try {
+        if (s.device.protocol == CastProtocol.chromecast) {
+          await _chromecast.stop();
+          await _chromecast.disconnect();
+        } else {
+          await _dlna.stop(s.device);
+        }
+      } catch (_) {}
     }
     await _proxy.stop();
     await WakelockPlus.disable();
@@ -292,28 +383,44 @@ class CastNotifier extends StateNotifier<CastState> {
         return;
       }
       try {
-        final info = await _dlna.getPositionInfo(device);
-        _pollFailures = 0;
-        _position = info.position;
-        _totalDuration = info.duration;
+        if (device.protocol == CastProtocol.chromecast) {
+          final status = await _chromecast.getMediaStatus();
+          if (status == null) return;
+          _pollFailures = 0;
+          _position = status.position;
+          _totalDuration = status.duration;
 
-        switch (info.transportState) {
-          case 'STOPPED':
-          case 'NO_MEDIA_PRESENT':
-            await stop();
-          case 'PAUSED_PLAYBACK':
-            // Sync pause state if TV was paused externally (e.g., TV remote).
-            final s = state;
-            if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
-          case 'PLAYING':
-            // Sync play state if TV was resumed externally.
-            final s = state;
-            if (s is CastPlaying && s.isPaused) state = s.copyWith(isPaused: false);
+          switch (status.state) {
+            case 'IDLE':
+              await stop();
+            case 'PAUSED':
+              final s = state;
+              if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
+            case 'PLAYING':
+            case 'BUFFERING':
+              final s = state;
+              if (s is CastPlaying && s.isPaused) state = s.copyWith(isPaused: false);
+          }
+        } else {
+          final info = await _dlna.getPositionInfo(device);
+          _pollFailures = 0;
+          _position = info.position;
+          _totalDuration = info.duration;
+
+          switch (info.transportState) {
+            case 'STOPPED':
+            case 'NO_MEDIA_PRESENT':
+              await stop();
+            case 'PAUSED_PLAYBACK':
+              final s = state;
+              if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
+            case 'PLAYING':
+              final s = state;
+              if (s is CastPlaying && s.isPaused) state = s.copyWith(isPaused: false);
+          }
         }
       } catch (_) {
         _pollFailures++;
-        // After 5 consecutive failures stop polling — avoids log spam.
-        // The cast session stays alive; TV may still be playing fine.
         if (_pollFailures >= 5) _progressTimer?.cancel();
       }
     });
@@ -327,7 +434,11 @@ class CastNotifier extends StateNotifier<CastState> {
 }
 
 final castProvider = StateNotifierProvider<CastNotifier, CastState>(
-  (ref) => CastNotifier(ref.watch(dlnaServiceProvider), ref.watch(streamProxyProvider)),
+  (ref) => CastNotifier(
+    ref.watch(dlnaServiceProvider),
+    ref.watch(chromecastServiceProvider),
+    ref.watch(streamProxyProvider),
+  ),
 );
 
 // Progress is kept in the notifier; expose via a simple provider

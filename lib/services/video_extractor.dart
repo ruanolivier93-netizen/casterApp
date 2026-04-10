@@ -1,5 +1,6 @@
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 import 'package:http/http.dart' as http;
+import 'package:xml/xml.dart';
 import '../models/video_info.dart';
 
 class VideoExtractorService {
@@ -17,6 +18,16 @@ class VideoExtractorService {
     if (host.contains('youtube.com') || host.contains('youtu.be') || host.contains('m.youtube.com')) {
       return _extractYouTube(url);
     }
+
+    // HLS manifest — parse for quality levels
+    if (url.toLowerCase().contains('.m3u8')) {
+      return _extractHls(url);
+    }
+    // DASH manifest — parse for quality levels
+    if (url.toLowerCase().endsWith('.mpd')) {
+      return _extractDash(url);
+    }
+
     return _extractDirect(url);
   }
 
@@ -170,4 +181,155 @@ class VideoExtractorService {
   }
 
   void dispose() => _yt.close();
+
+  // ── HLS (.m3u8) manifest parsing ──────────────────────────────────────────
+
+  Future<VideoInfo> _extractHls(String url) async {
+    try {
+      final response = await http.get(Uri.parse(url))
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode != 200) return _extractDirect(url);
+
+      final body = response.body;
+      final formats = <StreamFormat>[];
+      final lines = body.split('\n');
+      final baseUri = Uri.parse(url);
+
+      for (int i = 0; i < lines.length; i++) {
+        final line = lines[i].trim();
+        if (line.startsWith('#EXT-X-STREAM-INF:')) {
+          // Parse bandwidth and resolution
+          final bwMatch = RegExp(r'BANDWIDTH=(\d+)').firstMatch(line);
+          final resMatch = RegExp(r'RESOLUTION=(\d+)x(\d+)').firstMatch(line);
+          final bandwidth = int.tryParse(bwMatch?.group(1) ?? '') ?? 0;
+          final height = int.tryParse(resMatch?.group(2) ?? '') ?? 0;
+
+          // Next non-empty, non-comment line is the stream URL
+          String streamUrl = '';
+          for (int j = i + 1; j < lines.length; j++) {
+            final next = lines[j].trim();
+            if (next.isEmpty || next.startsWith('#')) continue;
+            streamUrl = next;
+            break;
+          }
+          if (streamUrl.isEmpty) continue;
+
+          // Make absolute URL
+          if (!streamUrl.startsWith('http')) {
+            streamUrl = baseUri.resolve(streamUrl).toString();
+          }
+
+          final label = height > 0
+              ? '${height}p · ${(bandwidth / 1000000).toStringAsFixed(1)} Mbps'
+              : '${(bandwidth / 1000).toStringAsFixed(0)} kbps';
+
+          formats.add(StreamFormat(
+            id: 'hls_$i',
+            label: label,
+            url: streamUrl,
+            height: height,
+            hasAudio: true,
+          ));
+        }
+      }
+
+      // Sort by height descending
+      formats.sort((a, b) => b.height.compareTo(a.height));
+
+      // If no stream variants found, it's a single-quality stream
+      if (formats.isEmpty) {
+        formats.add(StreamFormat(
+          id: 'hls_direct',
+          label: 'HLS stream',
+          url: url,
+          height: 0,
+          hasAudio: true,
+        ));
+      }
+
+      final filename = baseUri.pathSegments.isNotEmpty
+          ? Uri.decodeComponent(baseUri.pathSegments.last.split('?').first)
+          : 'HLS Stream';
+
+      return VideoInfo(
+        title: filename,
+        formats: formats,
+      );
+    } catch (e) {
+      return _extractDirect(url);
+    }
+  }
+
+  // ── DASH (.mpd) manifest parsing ──────────────────────────────────────────
+
+  Future<VideoInfo> _extractDash(String url) async {
+    try {
+      final response = await http.get(Uri.parse(url))
+          .timeout(const Duration(seconds: 10));
+      if (response.statusCode != 200) return _extractDirect(url);
+
+      final doc = XmlDocument.parse(response.body);
+      final baseUri = Uri.parse(url);
+      final formats = <StreamFormat>[];
+      int idx = 0;
+
+      for (final adaptSet in doc.findAllElements('AdaptationSet')) {
+        final mimeType = adaptSet.getAttribute('mimeType') ?? '';
+        final isVideo = mimeType.contains('video');
+        final isAudio = mimeType.contains('audio');
+
+        for (final rep in adaptSet.findElements('Representation')) {
+          final bandwidth = int.tryParse(rep.getAttribute('bandwidth') ?? '') ?? 0;
+          final height = int.tryParse(rep.getAttribute('height') ?? '') ?? 0;
+          final codecs = rep.getAttribute('codecs') ?? '';
+
+          // Get base URL from Representation or AdaptationSet
+          var streamUrl = url; // Default to MPD URL
+          final baseUrlEl = rep.findElements('BaseURL').firstOrNull ??
+              adaptSet.findElements('BaseURL').firstOrNull;
+          if (baseUrlEl != null) {
+            final bu = baseUrlEl.innerText.trim();
+            streamUrl = bu.startsWith('http') ? bu : baseUri.resolve(bu).toString();
+          }
+
+          final label = isVideo
+              ? '${height > 0 ? '${height}p' : '${(bandwidth / 1000).round()}k'} · $codecs${isAudio ? '' : ' · video only ⚠'}'
+              : 'Audio · $codecs · ${(bandwidth / 1000).round()} kbps';
+
+          formats.add(StreamFormat(
+            id: 'dash_${idx++}',
+            label: label,
+            url: streamUrl,
+            height: height,
+            hasAudio: isAudio || !isVideo, // Audio tracks always have audio
+          ));
+        }
+      }
+
+      // Sort: videos first (by height desc), then audio
+      formats.sort((a, b) {
+        if (a.height > 0 && b.height == 0) return -1;
+        if (a.height == 0 && b.height > 0) return 1;
+        return b.height.compareTo(a.height);
+      });
+
+      if (formats.isEmpty) {
+        formats.add(StreamFormat(
+          id: 'dash_direct',
+          label: 'DASH stream',
+          url: url,
+          height: 0,
+          hasAudio: true,
+        ));
+      }
+
+      final filename = baseUri.pathSegments.isNotEmpty
+          ? Uri.decodeComponent(baseUri.pathSegments.last.split('?').first)
+          : 'DASH Stream';
+
+      return VideoInfo(title: filename, formats: formats);
+    } catch (e) {
+      return _extractDirect(url);
+    }
+  }
 }
