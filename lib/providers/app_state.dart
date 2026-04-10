@@ -378,14 +378,26 @@ class CastNotifier extends StateNotifier<CastState> {
   Future<void> seek(Duration position) async {
     final s = state;
     if (s is! CastPlaying) return;
+    // Clamp to valid range
+    final clamped = Duration(
+      milliseconds: position.inMilliseconds.clamp(0, _totalDuration.inMilliseconds > 0 ? _totalDuration.inMilliseconds : position.inMilliseconds),
+    );
     try {
       if (s.device.protocol == CastProtocol.chromecast) {
-        await _chromecast.seek(position);
+        await _chromecast.seek(clamped);
       } else {
-        await _dlna.seek(s.device, position);
+        await _dlna.seek(s.device, clamped);
       }
-      _position = position;
+      _position = clamped;
+      // Re-emit state so castPositionProvider updates immediately
+      state = s.copyWith();
     } catch (_) {}
+  }
+
+  /// Skip forward or backward by [delta] from the current position.
+  Future<void> seekRelative(Duration delta) async {
+    final target = _position + delta;
+    await seek(target);
   }
 
   Future<void> stop() async {
