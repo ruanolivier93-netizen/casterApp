@@ -23,9 +23,9 @@ class StreamProxyService {
   String? _subtitleSrt; // SRT content served at /subtitle.srt
   String? _originalMimeType; // MIME type derived from the original URL
 
-  // Persistent client for connection pooling — avoids TCP handshake overhead
-  // per chunk and keeps connections alive for large streams.
-  final _client = http.Client();
+  // Fresh client per proxy session — avoids stale pooled connections from
+  // previous casts that can cause immediate "connection lost" on the TV.
+  http.Client? _client;
 
   bool get isRunning => _server != null;
 
@@ -50,6 +50,12 @@ class StreamProxyService {
     _extraHeaders = Map.of(extraHeaders);
     _subtitleSrt = subtitleSrt;
     _originalMimeType = _guessMime(streamUrl);
+
+    // Create a fresh HTTP client for each proxy session so we don't carry
+    // stale connections from a previous cast that might cause the TV to
+    // get "connection lost" immediately.
+    _client?.close();
+    _client = http.Client();
 
     // Remember the origin host — used as Origin/Referer for all proxied
     // requests (CDNs often require the original page domain, not whatever
@@ -243,11 +249,27 @@ class StreamProxyService {
       // Use HEAD for the upstream request too when the TV sends HEAD.
       // This avoids downloading the full body just to discard it.
       final method = isHead ? 'HEAD' : 'GET';
-      final upstreamReq = http.Request(method, Uri.parse(streamUrl))
-        ..headers.addAll(headers);
 
-      final upstreamResp = await _client.send(upstreamReq)
-          .timeout(const Duration(seconds: 60));
+      // Try up to 2 times — the first attempt can fail if the CDN resets
+      // the connection or if there's a transient DNS/network hiccup.
+      http.StreamedResponse? upstreamResp;
+      Object? lastError;
+      for (var attempt = 0; attempt < 2; attempt++) {
+        try {
+          final upstreamReq = http.Request(method, Uri.parse(streamUrl))
+            ..headers.addAll(headers);
+          upstreamResp = await _client!.send(upstreamReq)
+              .timeout(const Duration(seconds: 60));
+          break; // success
+        } catch (e) {
+          lastError = e;
+          if (attempt == 0) {
+            // Brief pause before retry
+            await Future.delayed(const Duration(milliseconds: 500));
+          }
+        }
+      }
+      if (upstreamResp == null) throw lastError ?? Exception('Upstream fetch failed');
 
       // ── HLS manifest? Rewrite URLs so everything goes through the proxy ──
       final ct = upstreamResp.headers['content-type'] ?? '';
@@ -381,6 +403,8 @@ class StreamProxyService {
     _extraHeaders = {};
     _subtitleSrt = null;
     _originalMimeType = null;
+    _client?.close();
+    _client = null;
   }
 
   /// Best-guess MIME type from file extension when upstream omits Content-Type.
@@ -435,5 +459,8 @@ class StreamProxyService {
     return null;
   }
 
-  void dispose() => _client.close();
+  void dispose() {
+    _client?.close();
+    _client = null;
+  }
 }
