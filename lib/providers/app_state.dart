@@ -9,6 +9,7 @@ import '../services/video_extractor.dart';
 import '../services/dlna_service.dart';
 import '../services/stream_proxy.dart';
 import '../services/chromecast_service.dart';
+import '../services/cast_background_service.dart';
 import '../services/subtitle_service.dart';
 import '../services/download_service.dart';
 import '../providers/queue_provider.dart';
@@ -288,6 +289,7 @@ class CastNotifier extends StateNotifier<CastState> {
     required bool routeThroughPhone,
     String? subtitleSrt,
     int? durationSeconds,
+    String? refererUrl,
   }) async {
     state = const CastPreparing();
     try {
@@ -299,6 +301,7 @@ class CastNotifier extends StateNotifier<CastState> {
         final baseUrl = await _proxy.start(
           streamUrl: format.url,
           subtitleSrt: subtitleSrt,
+          refererUrl: refererUrl,
         );
         if (baseUrl == null) {
           throw Exception('Could not start proxy. Make sure you\'re on WiFi.');
@@ -334,6 +337,7 @@ class CastNotifier extends StateNotifier<CastState> {
         routedThroughPhone: routeThroughPhone,
       );
       await WakelockPlus.enable();
+      await CastBackgroundService.start('Casting to ${device.name}');
       _startProgressPolling(device);
     } catch (e) {
       await _proxy.stop();
@@ -393,6 +397,7 @@ class CastNotifier extends StateNotifier<CastState> {
       } catch (_) {}
     }
     await _proxy.stop();
+    await CastBackgroundService.stop();
     await WakelockPlus.disable();
     _position = Duration.zero;
     _totalDuration = Duration.zero;
@@ -561,6 +566,10 @@ final selectedSubtitleProvider = StateProvider<SubtitleTrack?>((ref) => null);
 
 // URL injected from the in-app browser's "Cast" button.
 final browserCastUrlProvider = StateProvider<String?>((ref) => null);
+
+// The page URL the user was on when they tapped "Cast" — used as the
+// Referer when the proxy fetches from the CDN.
+final browserPageUrlProvider = StateProvider<String?>((ref) => null);
 
 // ── Cast History ──────────────────────────────────────────────────────────────
 

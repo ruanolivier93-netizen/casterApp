@@ -61,6 +61,74 @@ class _DetectedVideo {
         return 5;
     }
   }
+
+  /// Extract a human-readable stream label from the URL path.
+  /// e.g. "master", "index-v1-a1", "720p", etc.
+  String get streamLabel {
+    try {
+      final uri = Uri.parse(url);
+      final last = uri.pathSegments.isNotEmpty
+          ? Uri.decodeComponent(uri.pathSegments.last.split('?').first)
+          : '';
+      // Strip extension
+      final name = last.replaceAll(RegExp(r'\.(m3u8|mpd|mp4|ts|webm|mkv|avi|mov|flv)$', caseSensitive: false), '');
+      if (name.isNotEmpty && name.length < 60) return name;
+    } catch (_) {}
+    return '';
+  }
+
+  /// Detect format type badge text: "m3u8 (HLS)", "mp4", "mpd (DASH)", etc.
+  String get formatBadge {
+    final lower = url.toLowerCase();
+    String resolution = _extractResolution;
+    if (lower.contains('.m3u8')) {
+      if (resolution.isEmpty && lower.contains('master')) return 'm3u8 (HLS)';
+      return resolution.isNotEmpty ? 'm3u8 ($resolution)' : 'm3u8';
+    }
+    if (lower.contains('.mpd')) return resolution.isNotEmpty ? 'mpd ($resolution)' : 'mpd (DASH)';
+    if (lower.contains('.mp4')) return resolution.isNotEmpty ? 'mp4 ($resolution)' : 'mp4';
+    if (lower.contains('.webm')) return resolution.isNotEmpty ? 'webm ($resolution)' : 'webm';
+    if (lower.contains('.mkv')) return 'mkv';
+    if (lower.contains('.ts')) return 'ts';
+    if (lower.contains('.flv')) return 'flv';
+    if (lower.contains('.mov')) return 'mov';
+    if (lower.contains('.avi')) return 'avi';
+    // For embed URLs
+    if (type == 'embed') return 'embed';
+    if (type == 'page') return 'page';
+    return 'stream';
+  }
+
+  /// Try to extract resolution from URL path (e.g., 720, 1080, 1280x720).
+  String get _extractResolution {
+    final lower = url.toLowerCase();
+    // Match patterns like 1920x1080, 1280x720
+    final dimMatch = RegExp(r'(\d{3,4})x(\d{3,4})').firstMatch(lower);
+    if (dimMatch != null) return '${dimMatch.group(1)}x${dimMatch.group(2)}';
+    // Match patterns like /720p, -1080p, _480p
+    final pMatch = RegExp(r'[\/_\-](\d{3,4})p').firstMatch(lower);
+    if (pMatch != null) return '${pMatch.group(1)}p';
+    // Match patterns like /720/, height=720
+    final hMatch = RegExp(r'(?:height|h)[=\/](\d{3,4})').firstMatch(lower);
+    if (hMatch != null) return '${hMatch.group(1)}p';
+    return '';
+  }
+
+  /// Whether this is likely an HLS master playlist (contains variant streams).
+  bool get isMasterPlaylist {
+    final lower = url.toLowerCase();
+    return lower.contains('.m3u8') &&
+        (lower.contains('master') || lower.contains('index') && !RegExp(r'v\d').hasMatch(lower));
+  }
+
+  /// Extract the CDN/host domain for display.
+  String get hostLabel {
+    try {
+      return Uri.parse(url).host;
+    } catch (_) {
+      return '';
+    }
+  }
 }
 
 // ── Browser Tab Model ───────────────────────────────────────────────────────
@@ -75,6 +143,9 @@ class _BrowserTab {
   bool canGoForward = false;
   bool showBookmarks;
   final List<_DetectedVideo> detectedVideos;
+  String? thumbnailUrl; // og:image from the page
+  String? lastBlockedDomain; // last ad domain blocked (for notification bar)
+  DateTime? lastBlockedTime;
 
   _BrowserTab({
     required this.id,
@@ -162,9 +233,11 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
           if (AdBlocker.shouldBlock(request.url)) {
+            _onAdBlocked(tab, request.url);
             return NavigationDecision.prevent;
           }
           if (AdBlocker.isPopupOrRedirect(request.url)) {
+            _onAdBlocked(tab, request.url);
             return NavigationDecision.prevent;
           }
           return NavigationDecision.navigate;
@@ -187,6 +260,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
               (document.head || document.documentElement).appendChild(s);
             })();
           ''');
+          tab.controller.runJavaScript(AdBlocker.earlyJsScript);
           tab.controller.runJavaScript(AdBlocker.videoDetectorScript);
         },
         onProgress: (p) {
@@ -209,6 +283,17 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           }
           tab.controller.runJavaScript(AdBlocker.jsScript);
           tab.controller.runJavaScript(AdBlocker.videoDetectorScript);
+          // Extract page thumbnail (og:image) for video list
+          tab.controller.runJavaScript('''
+            (function() {
+              var meta = document.querySelector('meta[property="og:image"]');
+              if (!meta) meta = document.querySelector('meta[name="twitter:image"]');
+              if (!meta) meta = document.querySelector('meta[property="og:image:url"]');
+              if (meta && meta.content) {
+                VideoDetector.postMessage(JSON.stringify({url: meta.content, type: 'thumbnail'}));
+              }
+            })();
+          ''');
           ref.read(historyProvider.notifier).add(pageUrl, title);
         },
       ));
@@ -299,10 +384,37 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       final url = data['url'] as String? ?? '';
       final type = data['type'] as String? ?? '';
       if (url.isEmpty) return;
+      // Handle thumbnail extraction
+      if (type == 'thumbnail') {
+        if (mounted) setState(() => tab.thumbnailUrl = url);
+        return;
+      }
       if (tab.detectedVideos.any((v) => v.url == url)) return;
       if (mounted) {
         setState(() {
           tab.detectedVideos.add(_DetectedVideo(url: url, type: type));
+        });
+      }
+    } catch (_) {}
+  }
+
+  void _onAdBlocked(_BrowserTab tab, String url) {
+    try {
+      final host = Uri.tryParse(url)?.host ?? '';
+      if (host.isEmpty) return;
+      if (mounted) {
+        setState(() {
+          tab.lastBlockedDomain = host;
+          tab.lastBlockedTime = DateTime.now();
+        });
+        // Auto-dismiss after 4 seconds
+        Future.delayed(const Duration(seconds: 4), () {
+          if (mounted && tab.lastBlockedDomain == host) {
+            setState(() {
+              tab.lastBlockedDomain = null;
+              tab.lastBlockedTime = null;
+            });
+          }
         });
       }
     } catch (_) {}
@@ -442,6 +554,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   }
 
   void _castBest() {
+    // Store the current page URL so the proxy can use it as Referer.
+    ref.read(browserPageUrlProvider.notifier).state = _currentUrl;
     if (_detectedVideos.isNotEmpty) {
       final sorted = List<_DetectedVideo>.from(_detectedVideos)
         ..sort((a, b) => a.priority.compareTo(b.priority));
@@ -452,7 +566,9 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   }
 
   void _showVideoPicker() {
-    final cs = Theme.of(context).colorScheme;
+    final settings = ref.read(settingsProvider);
+    final pageTitle = _activeTab.title;
+    final thumbnail = _activeTab.thumbnailUrl;
 
     // Sort: direct streams first, embeds last
     final sorted = List<_DetectedVideo>.from(_detectedVideos)
@@ -465,90 +581,34 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       items.insert(0, _DetectedVideo(url: _currentUrl, type: 'page'));
     }
 
-    showModalBottomSheet(
-      context: context,
-      isScrollControlled: true,
-      shape: const RoundedRectangleBorder(
-        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (ctx) => _VideoListScreen(
+          items: items,
+          pageTitle: pageTitle,
+          thumbnailUrl: thumbnail,
+          routeThroughPhone: settings.routeThroughPhone,
+          onCast: (video) {
+            ref.read(browserPageUrlProvider.notifier).state = _currentUrl;
+            widget.onCastUrl(_normalizeForCast(video.url));
+          },
+          onToggleRoute: () {
+            ref.read(settingsProvider.notifier).toggle();
+          },
+          onDownload: (video) {
+            ref.read(downloadServiceProvider).download(
+              url: video.url,
+              filename: _filenameFromUrl(video.url),
+            );
+            ScaffoldMessenger.of(ctx).showSnackBar(
+              const SnackBar(
+                content: Text('Download started — check Files tab'),
+                duration: Duration(seconds: 2),
+              ),
+            );
+          },
+        ),
       ),
-      builder: (ctx) {
-        final maxH = MediaQuery.of(ctx).size.height * 0.7;
-        return ConstrainedBox(
-          constraints: BoxConstraints(maxHeight: maxH),
-          child: ListView.builder(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-            shrinkWrap: true,
-            itemCount: items.length + 1, // +1 for header
-            itemBuilder: (_, i) {
-              if (i == 0) {
-                return Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Center(
-                      child: Container(
-                        width: 40, height: 4,
-                        margin: const EdgeInsets.only(bottom: 12),
-                        decoration: BoxDecoration(
-                          color: cs.onSurfaceVariant.withAlpha(80),
-                          borderRadius: BorderRadius.circular(2),
-                        ),
-                      ),
-                    ),
-                    Row(children: [
-                      Icon(Icons.cast, color: cs.primary, size: 22),
-                      const SizedBox(width: 8),
-                      Text(
-                        'Cast a video',
-                        style: Theme.of(ctx).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.w600),
-                      ),
-                      const Spacer(),
-                      Text(
-                        '${items.length} found',
-                        style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                      ),
-                    ]),
-                    const SizedBox(height: 4),
-                    Text(
-                      'Tap a video to cast it to your TV.',
-                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
-                    ),
-                    const SizedBox(height: 8),
-                    const Divider(height: 1),
-                  ],
-                );
-              }
-              final v = items[i - 1];
-              final label = v.type == 'page' ? 'This page' : _videoLabel(v.url);
-              final typeText = v.type == 'page' ? 'YouTube page' : _typeLabel(v.type);
-              return ListTile(
-                contentPadding: const EdgeInsets.symmetric(vertical: 4),
-                leading: CircleAvatar(
-                  backgroundColor: cs.primaryContainer,
-                  child: Icon(_typeIcon(v.type), color: cs.primary, size: 20),
-                ),
-                title: Text(label,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500)),
-                subtitle: Text(typeText,
-                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-                trailing: FilledButton.icon(
-                  icon: const Icon(Icons.cast, size: 16),
-                  label: const Text('Cast'),
-                  style: FilledButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-                    textStyle: const TextStyle(fontSize: 12),
-                  ),
-                  onPressed: () {
-                    Navigator.pop(ctx);
-                    widget.onCastUrl(_normalizeForCast(v.url));
-                  },
-                ),
-              );
-            },
-          ),
-        );
-      },
     );
   }
 
@@ -614,6 +674,9 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                   .toList(),
             ),
           ),
+          // ── Ad-blocked notification bar ──
+          if (_activeTab.lastBlockedDomain != null)
+            _buildAdBlockedBar(cs),
           // ── Inline Cast Panel ─────────────────────────────────────────────
           const _BrowserCastPanel(),
         ],
@@ -1163,6 +1226,45 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     );
   }
 
+  Widget _buildAdBlockedBar(ColorScheme cs) {
+    final domain = _activeTab.lastBlockedDomain;
+    if (domain == null) return const SizedBox.shrink();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      color: cs.errorContainer,
+      child: Row(
+        children: [
+          Icon(Icons.shield, size: 16, color: cs.error),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              'Ad redirect blocked  —  $domain',
+              style: TextStyle(
+                fontSize: 12,
+                fontWeight: FontWeight.w500,
+                color: cs.onErrorContainer,
+              ),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+          InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: () => setState(() {
+              _activeTab.lastBlockedDomain = null;
+              _activeTab.lastBlockedTime = null;
+            }),
+            child: Padding(
+              padding: const EdgeInsets.all(4),
+              child: Icon(Icons.close, size: 14, color: cs.onErrorContainer),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   String _filenameFromUrl(String url) {
     try {
       final uri = Uri.parse(url);
@@ -1530,6 +1632,7 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                           title: videoState.info.title,
                           routeThroughPhone: settings.routeThroughPhone,
                           durationSeconds: videoState.info.durationSeconds,
+                          refererUrl: ref.read(browserPageUrlProvider),
                         );
                       }
                     : null,
@@ -1819,5 +1922,311 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
     final m = (d.inMinutes % 60).toString().padLeft(2, '0');
     final s = (d.inSeconds % 60).toString().padLeft(2, '0');
     return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+}
+
+// ── Video List Screen (WVC-style) ───────────────────────────────────────────
+
+class _VideoListScreen extends StatefulWidget {
+  final List<_DetectedVideo> items;
+  final String pageTitle;
+  final String? thumbnailUrl;
+  final bool routeThroughPhone;
+  final void Function(_DetectedVideo) onCast;
+  final VoidCallback onToggleRoute;
+  final void Function(_DetectedVideo) onDownload;
+
+  const _VideoListScreen({
+    required this.items,
+    required this.pageTitle,
+    this.thumbnailUrl,
+    required this.routeThroughPhone,
+    required this.onCast,
+    required this.onToggleRoute,
+    required this.onDownload,
+  });
+
+  @override
+  State<_VideoListScreen> createState() => _VideoListScreenState();
+}
+
+class _VideoListScreenState extends State<_VideoListScreen> {
+  late bool _routeThroughPhone;
+
+  @override
+  void initState() {
+    super.initState();
+    _routeThroughPhone = widget.routeThroughPhone;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final tt = Theme.of(context).textTheme;
+
+    return Scaffold(
+      appBar: AppBar(
+        title: const Text('Video list'),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () => Navigator.pop(context),
+        ),
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.cast, size: 22),
+            tooltip: 'Cast best',
+            onPressed: widget.items.isNotEmpty
+                ? () {
+                    Navigator.pop(context);
+                    widget.onCast(widget.items.first);
+                  }
+                : null,
+          ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert),
+            onSelected: (val) {
+              // Future: add more menu actions
+            },
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: 'help', child: Text('Help')),
+            ],
+          ),
+        ],
+      ),
+      body: Column(
+        children: [
+          // ── Route through phone toggle ──
+          Material(
+            color: cs.surfaceContainerLow,
+            child: InkWell(
+              onTap: () {
+                setState(() => _routeThroughPhone = !_routeThroughPhone);
+                widget.onToggleRoute();
+              },
+              child: Padding(
+                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                child: Row(
+                  children: [
+                    Icon(Icons.phone_android, size: 20, color: cs.onSurfaceVariant),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Text(
+                        'Route video through phone',
+                        style: tt.bodyMedium?.copyWith(color: cs.onSurface),
+                      ),
+                    ),
+                    SizedBox(
+                      width: 24, height: 24,
+                      child: Checkbox(
+                        value: _routeThroughPhone,
+                        onChanged: (_) {
+                          setState(() => _routeThroughPhone = !_routeThroughPhone);
+                          widget.onToggleRoute();
+                        },
+                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+          const Divider(height: 1),
+          // ── Video items list ──
+          Expanded(
+            child: widget.items.isEmpty
+                ? Center(
+                    child: Column(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(Icons.videocam_off, size: 48, color: cs.onSurfaceVariant.withAlpha(100)),
+                        const SizedBox(height: 12),
+                        Text('No videos detected',
+                            style: tt.bodyLarge?.copyWith(color: cs.onSurfaceVariant)),
+                      ],
+                    ),
+                  )
+                : ListView.separated(
+                    itemCount: widget.items.length,
+                    separatorBuilder: (_, __) => const Divider(height: 1, indent: 80),
+                    itemBuilder: (ctx, i) {
+                      final video = widget.items[i];
+                      return _VideoListTile(
+                        video: video,
+                        pageTitle: widget.pageTitle,
+                        thumbnailUrl: widget.thumbnailUrl,
+                        onTap: () {
+                          Navigator.pop(context);
+                          widget.onCast(video);
+                        },
+                        onDownload: () {
+                          widget.onDownload(video);
+                        },
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ── Video List Tile (WVC-style) ─────────────────────────────────────────────
+
+class _VideoListTile extends StatelessWidget {
+  final _DetectedVideo video;
+  final String pageTitle;
+  final String? thumbnailUrl;
+  final VoidCallback onTap;
+  final VoidCallback onDownload;
+
+  const _VideoListTile({
+    required this.video,
+    required this.pageTitle,
+    this.thumbnailUrl,
+    required this.onTap,
+    required this.onDownload,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+
+    return InkWell(
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // ── Thumbnail ──
+            ClipRRect(
+              borderRadius: BorderRadius.circular(6),
+              child: SizedBox(
+                width: 60,
+                height: 44,
+                child: thumbnailUrl != null && thumbnailUrl!.isNotEmpty
+                    ? Image.network(
+                        thumbnailUrl!,
+                        fit: BoxFit.cover,
+                        errorBuilder: (_, __, ___) => Container(
+                          color: cs.surfaceContainerHighest,
+                          child: Icon(Icons.play_circle_outline,
+                              size: 24, color: cs.onSurfaceVariant),
+                        ),
+                      )
+                    : Container(
+                        color: cs.surfaceContainerHighest,
+                        child: Icon(Icons.play_circle_outline,
+                            size: 24, color: cs.onSurfaceVariant),
+                      ),
+              ),
+            ),
+            const SizedBox(width: 12),
+            // ── Info column ──
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Page title
+                  Text(
+                    pageTitle.isNotEmpty ? pageTitle : 'Untitled',
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w500,
+                      color: cs.onSurface,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  // Host domain
+                  Text(
+                    video.hostLabel,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                  ),
+                  const SizedBox(height: 4),
+                  // Stream label + format badge row
+                  Row(
+                    children: [
+                      if (video.streamLabel.isNotEmpty)
+                        Flexible(
+                          child: Text(
+                            video.streamLabel,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.w500,
+                              color: cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                      if (video.streamLabel.isNotEmpty) const SizedBox(width: 8),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: const Color(0xFF2E7D32),
+                          borderRadius: BorderRadius.circular(4),
+                        ),
+                        child: Text(
+                          video.formatBadge,
+                          style: const TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w600,
+                            color: Colors.white,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            // ── Three-dot menu ──
+            PopupMenuButton<String>(
+              icon: Icon(Icons.more_vert, size: 20, color: cs.onSurfaceVariant),
+              padding: EdgeInsets.zero,
+              constraints: const BoxConstraints(),
+              onSelected: (val) {
+                switch (val) {
+                  case 'cast':
+                    onTap();
+                    break;
+                  case 'download':
+                    onDownload();
+                    break;
+                }
+              },
+              itemBuilder: (_) => [
+                const PopupMenuItem(
+                  value: 'cast',
+                  child: ListTile(
+                    dense: true,
+                    leading: Icon(Icons.cast, size: 20),
+                    title: Text('Cast', style: TextStyle(fontSize: 13)),
+                    contentPadding: EdgeInsets.zero,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+                const PopupMenuItem(
+                  value: 'download',
+                  child: ListTile(
+                    dense: true,
+                    leading: Icon(Icons.download, size: 20),
+                    title: Text('Download', style: TextStyle(fontSize: 13)),
+                    contentPadding: EdgeInsets.zero,
+                    visualDensity: VisualDensity.compact,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }

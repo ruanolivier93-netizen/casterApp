@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
@@ -9,9 +10,15 @@ import 'package:http/http.dart' as http;
 /// geo-restrictions, and URLs the TV can't resolve itself.
 ///
 /// Also serves local device files (file:// URLs) over HTTP so TVs can play them.
+///
+/// For HLS streams, the proxy rewrites manifest URLs so the TV fetches every
+/// segment through this server instead of hitting the CDN directly (which
+/// would fail without auth headers / cookies the TV doesn't have).
 class StreamProxyService {
   HttpServer? _server;
   String? _streamUrl;
+  String? _baseUrl; // e.g. http://192.168.1.5:12345
+  String? _originHost; // Origin/Referer host for all proxied requests
   Map<String, String> _extraHeaders = {};
   String? _subtitleSrt; // SRT content served at /subtitle.srt
   String? _originalMimeType; // MIME type derived from the original URL
@@ -28,10 +35,14 @@ class StreamProxyService {
 
   /// Returns the base URL for the proxy (e.g. http://192.168.1.5:12345).
   /// Stream is at /stream, subtitles at /subtitle.srt.
+  ///
+  /// [refererUrl] — optional page URL the video was found on.  Used as
+  /// Origin/Referer for upstream requests so CDNs see the correct domain.
   Future<String?> start({
     required String streamUrl,
     Map<String, String> extraHeaders = const {},
     String? subtitleSrt,
+    String? refererUrl,
   }) async {
     await stop();
 
@@ -40,6 +51,18 @@ class StreamProxyService {
     _subtitleSrt = subtitleSrt;
     _originalMimeType = _guessMime(streamUrl);
 
+    // Remember the origin host — used as Origin/Referer for all proxied
+    // requests (CDNs often require the original page domain, not whatever
+    // CDN sub-domain a segment happens to be hosted on).
+    // Prefer the explicit page referer over the stream URL's host.
+    final refHost = refererUrl != null ? Uri.tryParse(refererUrl) : null;
+    final strHost = Uri.tryParse(streamUrl);
+    if (refHost != null && refHost.host.isNotEmpty) {
+      _originHost = '${refHost.scheme}://${refHost.host}';
+    } else if (strHost != null && strHost.host.isNotEmpty) {
+      _originHost = '${strHost.scheme}://${strHost.host}';
+    }
+
     final ip = await _localIP();
     if (ip == null) return null;
 
@@ -47,8 +70,9 @@ class StreamProxyService {
     // This eliminates the hardcoded-port-9876 collision bug.
     _server = await HttpServer.bind(InternetAddress.anyIPv4, 0);
     final port = _server!.port;
+    _baseUrl = 'http://$ip:$port';
     _serve();
-    return 'http://$ip:$port';
+    return _baseUrl;
   }
 
   /// The stream URL the TV should fetch.
@@ -84,6 +108,19 @@ class StreamProxyService {
           ..headers.set('Access-Control-Allow-Origin', '*')
           ..write(_subtitleSrt);
         await req.response.close();
+        return;
+      }
+
+      // ── Proxy endpoint — proxies arbitrary URLs (used for HLS segments,
+      //    variant playlists, encryption keys, etc.) ──────────────────────
+      if (path == '/proxy') {
+        final proxyUrl = req.uri.queryParameters['url'];
+        if (proxyUrl == null || proxyUrl.isEmpty) {
+          req.response.statusCode = 400;
+          await req.response.close();
+          return;
+        }
+        await _proxyRemoteStream(req, proxyUrl);
         return;
       }
 
@@ -171,6 +208,9 @@ class StreamProxyService {
   }
 
   /// Proxies a remote HTTP stream to the local TV.
+  /// If the response is an HLS manifest (.m3u8), segment/variant URLs are
+  /// rewritten to go through this proxy so the TV never contacts the CDN
+  /// directly (which would fail without proper headers/cookies).
   Future<void> _proxyRemoteStream(HttpRequest req, String streamUrl) async {
     try {
       final parsedUrl = Uri.parse(streamUrl);
@@ -187,10 +227,11 @@ class StreamProxyService {
         'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Connection': 'keep-alive',
-        // Origin and Referer are required by many CDNs and YouTube to allow
-        // cross-origin requests; without them the server returns 403.
-        'Origin': '${parsedUrl.scheme}://${parsedUrl.host}',
-        'Referer': '${parsedUrl.scheme}://${parsedUrl.host}/',
+        // Use the original stream's host as Origin/Referer for ALL proxied
+        // requests.  CDNs validate Referer against the page that initiated
+        // playback, not against whichever sub-domain serves each segment.
+        'Origin': _originHost ?? '${parsedUrl.scheme}://${parsedUrl.host}',
+        'Referer': _originHost != null ? '$_originHost/' : '${parsedUrl.scheme}://${parsedUrl.host}/',
         ..._extraHeaders,
       };
 
@@ -202,8 +243,16 @@ class StreamProxyService {
         ..headers.addAll(headers);
 
       final upstreamResp = await _client.send(upstreamReq)
-          .timeout(const Duration(seconds: 30));
+          .timeout(const Duration(seconds: 60));
 
+      // ── HLS manifest? Rewrite URLs so everything goes through the proxy ──
+      final ct = upstreamResp.headers['content-type'] ?? '';
+      if (_isHlsUrl(streamUrl) || _isHlsContentType(ct)) {
+        await _serveRewrittenHls(req, upstreamResp, streamUrl);
+        return;
+      }
+
+      // ── Normal (MP4, TS segment, etc.) — pipe bytes straight through ──
       req.response.statusCode = upstreamResp.statusCode;
 
       for (final entry in upstreamResp.headers.entries) {
@@ -213,7 +262,9 @@ class StreamProxyService {
           case 'content-range':
           case 'accept-ranges':
           case 'cache-control':
-          case 'transfer-encoding':
+            // Note: we intentionally skip 'transfer-encoding' — let Dart's
+            // HttpResponse manage chunked encoding automatically to avoid
+            // conflicting headers that confuse some TVs.
             req.response.headers.set(entry.key, entry.value);
         }
       }
@@ -243,10 +294,79 @@ class StreamProxyService {
     }
   }
 
+  // ── HLS manifest rewriting ──────────────────────────────────────────────
+
+  bool _isHlsUrl(String url) {
+    final lower = url.toLowerCase().split('?').first;
+    return lower.contains('.m3u8');
+  }
+
+  bool _isHlsContentType(String ct) {
+    final lower = ct.toLowerCase();
+    return lower.contains('mpegurl') || lower.contains('x-mpegurl');
+  }
+
+  /// Reads the full HLS manifest body, rewrites every URL to go through our
+  /// /proxy endpoint, and serves the result to the TV.
+  Future<void> _serveRewrittenHls(
+      HttpRequest req, http.StreamedResponse resp, String manifestUrl) async {
+    try {
+      final bodyBytes = await resp.stream.toBytes();
+      final manifest = utf8.decode(bodyBytes, allowMalformed: true);
+      final rewritten = _rewriteHlsManifest(manifest, manifestUrl);
+
+      req.response
+        ..statusCode = 200
+        ..headers.set('Content-Type', 'application/x-mpegURL; charset=utf-8')
+        ..headers.set('Access-Control-Allow-Origin', '*')
+        ..write(rewritten);
+      await req.response.close();
+    } catch (_) {
+      try {
+        req.response.statusCode = 502;
+        await req.response.close();
+      } catch (_) {}
+    }
+  }
+
+  /// Rewrites all URLs in an HLS manifest (master or media playlist) so that
+  /// each URL points to our local `/proxy?url=<encoded>` endpoint.
+  String _rewriteHlsManifest(String manifest, String manifestUrl) {
+    final baseUri = Uri.parse(manifestUrl);
+    final lines = manifest.split('\n');
+    final buf = StringBuffer();
+
+    for (final line in lines) {
+      if (line.startsWith('#')) {
+        // Rewrite URI="..." in tags like #EXT-X-KEY, #EXT-X-MAP, etc.
+        buf.writeln(_rewriteHlsTagUris(line, baseUri));
+      } else if (line.trim().isNotEmpty) {
+        // Non-comment, non-empty → segment or variant playlist URL
+        final resolved = baseUri.resolve(line.trim()).toString();
+        buf.writeln('$_baseUrl/proxy?url=${Uri.encodeComponent(resolved)}');
+      } else {
+        buf.writeln(line);
+      }
+    }
+
+    return buf.toString();
+  }
+
+  /// Rewrites URI="..." attributes inside HLS tags (e.g. #EXT-X-KEY, #EXT-X-MAP).
+  String _rewriteHlsTagUris(String line, Uri baseUri) {
+    return line.replaceAllMapped(RegExp(r'URI="([^"]*)"'), (m) {
+      final uri = m.group(1)!;
+      final resolved = baseUri.resolve(uri).toString();
+      return 'URI="$_baseUrl/proxy?url=${Uri.encodeComponent(resolved)}"';
+    });
+  }
+
   Future<void> stop() async {
     await _server?.close(force: true);
     _server = null;
     _streamUrl = null;
+    _baseUrl = null;
+    _originHost = null;
     _extraHeaders = {};
     _subtitleSrt = null;
     _originalMimeType = null;

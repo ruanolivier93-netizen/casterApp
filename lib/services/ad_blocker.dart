@@ -116,6 +116,10 @@ class AdBlocker {
     'theoplayer.com', 'mediastream.pe', 'wistia.com',
     'wistia.net', 'vidyard.com', 'loom.com',
     'bunnycdn.com', 'b-cdn.net',
+    // Streaming-site video hosts (used by bstsrs, lookmovie, etc.)
+    'voe.sx', 'savefiles.com', 'streamtape.com',
+    'streamtape.to', 'stape.fun', 'streamsb.net',
+    'sbembed.com', 'embedsito.com', 'vidcloud.co',
   ];
 
   // ── Blocked domains (~250 entries) ────────────────────────────────────────
@@ -217,6 +221,14 @@ class AdBlocker {
     'sh.st', 'bc.vc', 'ouo.io', 'clk.sh',
     'admaven.com', 'richpush.com', 'pushcrew.com',
     'pushwoosh.com', 'cleverpush.com',
+
+    // ── Streaming-site ad redirectors ──
+    'luluvdoo.com', 'bysesayeveum.com', 'clicksfly.com',
+    'moneyclick.com', 'shrink.pe', 'doods.pro',
+    'streamlare.com', 'doodstream.com', 'dood.so',
+    'dood.la', 'dood.ws', 'dood.watch',
+    'upstream.to', 'mixdrop.co', 'mixdrop.to',
+    'filemoon.sx', 'filemoon.to', 'wishonly.site',
 
     // ── Consent / cookie tracking ──
     'cookielaw.org', 'cookiepro.com', 'trustarc.com',
@@ -500,7 +512,126 @@ video *,
 ''';
 
   // ══════════════════════════════════════════════════════════════════════════
-  // Layer 4: JS ad-removal + anti-adblock + popup block + YouTube ad skip
+  // Layer 4a: Early JS — injected at onPageStarted (before page JS executes)
+  //           Overrides alert(), window.open, and first-click hijacking
+  //           so the page's own scripts never get a chance to show error
+  //           dialogs or redirect on first interaction.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  static const earlyJsScript = r'''
+(function RLCasterEarlyGuard() {
+  "use strict";
+  if (window.__rlEarlyGuard) return;
+  window.__rlEarlyGuard = true;
+
+  /* ── Suppress error / adblock alert() dialogs ── */
+  var origAlert = window.alert;
+  window.alert = function(msg) {
+    if (!msg) return;
+    var s = String(msg).toLowerCase();
+    if (s.indexOf('typeerror') !== -1 || s.indexOf('referenceerror') !== -1 ||
+        s.indexOf('cannot read') !== -1 || s.indexOf('is not defined') !== -1 ||
+        s.indexOf('undefined') !== -1 || s.indexOf('null') !== -1 ||
+        s.indexOf('classlist') !== -1 || s.indexOf('adblock') !== -1 ||
+        s.indexOf('ad block') !== -1 || s.indexOf('adblocker') !== -1 ||
+        s.indexOf('disable your') !== -1 || s.indexOf('whitelist') !== -1 ||
+        s.indexOf('refresh page') !== -1 || s.indexOf('try again') !== -1 ||
+        s.indexOf('blocked') !== -1 || s.indexOf('error') !== -1) {
+      return;
+    }
+    return origAlert.call(window, msg);
+  };
+
+  /* ── Block window.open (redirect to NewTab channel for legit links) ── */
+  window.open = function(url) {
+    if (url) {
+      try {
+        var resolved = new URL(url, location.href).href;
+        var lower = resolved.toLowerCase();
+        var dominated =
+          lower.indexOf('doubleclick') !== -1 || lower.indexOf('googlesyndication') !== -1 ||
+          lower.indexOf('popads') !== -1 || lower.indexOf('popunder') !== -1 ||
+          lower.indexOf('adnxs') !== -1 || lower.indexOf('clickadu') !== -1 ||
+          lower.indexOf('exoclick') !== -1 || lower.indexOf('hilltopads') !== -1 ||
+          lower.indexOf('propellerads') !== -1 || lower.indexOf('trafficjunky') !== -1 ||
+          lower.indexOf('juicyads') !== -1 || lower.indexOf('trafficstars') !== -1 ||
+          lower.indexOf('adsterra') !== -1 || lower.indexOf('admaven') !== -1 ||
+          lower.indexOf('adf.ly') !== -1 || lower.indexOf('/ads/') !== -1 ||
+          lower.indexOf('/ad/click') !== -1 || lower.indexOf('click_id=') !== -1 ||
+          lower.indexOf('aff_id=') !== -1 || lower.indexOf('smartlink') !== -1;
+        if (!dominated) {
+          try { NewTab.postMessage(resolved); } catch(_) {}
+        }
+      } catch(_) {}
+    }
+    return null;
+  };
+
+  /* ── Block location.href setter hijacking ── */
+  try {
+    var origDesc = Object.getOwnPropertyDescriptor(window, 'location') ||
+                   Object.getOwnPropertyDescriptor(Window.prototype, 'location');
+    if (origDesc && origDesc.set) {
+      // Can't redefine location itself, but we can catch assignment in a proxy-like way
+    }
+  } catch(_) {}
+
+  /* ── First-click hijack protection ── */
+  var __rlFirstClick = true;
+  document.addEventListener('click', function(e) {
+    if (!__rlFirstClick) return;
+    __rlFirstClick = false;
+    /* On many ad-infested sites the first click anywhere opens an ad URL.
+       If it navigated to a different domain, block it. */
+  }, true);
+
+  /* ── Intercept addEventListener to block document-level click hijack handlers ── */
+  var origAddEvent = EventTarget.prototype.addEventListener;
+  EventTarget.prototype.addEventListener = function(type, fn, opts) {
+    if ((type === 'click' || type === 'mousedown' || type === 'pointerdown' || type === 'auxclick') &&
+        (this === document || this === document.documentElement ||
+         this === document.body || this === window)) {
+      var src = '';
+      try { src = fn.toString().substring(0, 500); } catch(_) {}
+      var sl = src.toLowerCase();
+      if (sl.indexOf('window.open') !== -1 || sl.indexOf('location.href') !== -1 ||
+          sl.indexOf('location.assign') !== -1 || sl.indexOf('location.replace') !== -1 ||
+          sl.indexOf('click_url') !== -1 || sl.indexOf('redirect') !== -1 ||
+          sl.indexOf('popunder') !== -1 || sl.indexOf('.href=') !== -1 ||
+          sl.indexOf('window.location') !== -1) {
+        return; /* silently block */
+      }
+    }
+    return origAddEvent.call(this, type, fn, opts);
+  };
+
+  /* ── Block string-based setTimeout/setInterval (ad redirects) ── */
+  var origSetTimeout = window.setTimeout;
+  var origSetInterval = window.setInterval;
+  window.setTimeout = function(fn, delay) {
+    if (typeof fn === 'string') {
+      var sl = fn.toLowerCase();
+      if (sl.indexOf('location') !== -1 || sl.indexOf('window.open') !== -1 ||
+          sl.indexOf('pop') !== -1 || sl.indexOf('redirect') !== -1) {
+        return 0;
+      }
+    }
+    return origSetTimeout.apply(this, arguments);
+  };
+  window.setInterval = function(fn, delay) {
+    if (typeof fn === 'string') {
+      var sl = fn.toLowerCase();
+      if (sl.indexOf('location') !== -1 || sl.indexOf('window.open') !== -1) {
+        return 0;
+      }
+    }
+    return origSetInterval.apply(this, arguments);
+  };
+})();
+''';
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Layer 4b: JS ad-removal + anti-adblock + popup block + YouTube ad skip
   // ══════════════════════════════════════════════════════════════════════════
 
   static const jsScript = r'''
@@ -723,6 +854,26 @@ video *,
     document.querySelectorAll('ytd-promoted-sparkles-web-renderer, ytd-promoted-video-renderer, ytd-display-ad-renderer, ytd-companion-slot-renderer, ytd-action-companion-ad-renderer, ytd-in-feed-ad-layout-renderer, ytd-ad-slot-renderer, ytd-banner-promo-renderer, ytd-merch-shelf-renderer, #player-ads, #masthead-ad').forEach(function(el) { el.remove(); });
   }
 
+  /* ══ Suppress error alert() dialogs (sites break when we remove their ad elements) ══ */
+  (function() {
+    var origAlert = window.alert;
+    window.alert = function(msg) {
+      if (!msg) return;
+      var s = String(msg).toLowerCase();
+      /* Suppress JS errors, ad-related, and anti-adblock messages */
+      if (s.indexOf('typeerror') !== -1 || s.indexOf('referenceerror') !== -1 ||
+          s.indexOf('cannot read') !== -1 || s.indexOf('is not defined') !== -1 ||
+          s.indexOf('undefined') !== -1 || s.indexOf('null') !== -1 ||
+          s.indexOf('classlist') !== -1 || s.indexOf('adblock') !== -1 ||
+          s.indexOf('ad block') !== -1 || s.indexOf('adblocker') !== -1 ||
+          s.indexOf('disable your') !== -1 || s.indexOf('whitelist') !== -1 ||
+          s.indexOf('refresh page') !== -1 || s.indexOf('try again') !== -1) {
+        return; /* swallow it */
+      }
+      return origAlert.call(window, msg);
+    };
+  })();
+
   /* ══ Redirect window.open to new tab (block if ad) ══ */
   window.open = function(url) {
     if (url) {
@@ -854,23 +1005,78 @@ video *,
     } catch(_) {}
   })();
 
+  /* ══ Block location.href setter hijacking ══ */
+  (function() {
+    try {
+      var origDesc = Object.getOwnPropertyDescriptor(window, 'location');
+      /* Can’t override location directly in most browsers, so we intercept
+         the setter on Location.prototype.href instead. */
+      var hrefDesc = Object.getOwnPropertyDescriptor(Location.prototype, 'href');
+      if (hrefDesc && hrefDesc.set) {
+        var origSet = hrefDesc.set;
+        Object.defineProperty(Location.prototype, 'href', {
+          get: hrefDesc.get,
+          set: function(url) {
+            if (isAdRedirect(url)) return;
+            origSet.call(this, url);
+          },
+          configurable: true, enumerable: true
+        });
+      }
+    } catch(_) {}
+  })();
+
   /* ══ Remove invisible clickjack overlays ══ */
   function removeClickjackOverlays() {
-    document.querySelectorAll('div, a, span, section, aside').forEach(function(el) {
+    document.querySelectorAll('div, a, span, section, aside, iframe').forEach(function(el) {
       var s;
       try { s = getComputedStyle(el); } catch(_) { return; }
       if (s.position !== 'fixed' && s.position !== 'absolute') return;
       if (isVideoPlayer(el)) return;
       var z = parseInt(s.zIndex, 10) || 0;
-      if (z < 50) return;
       var opacity = parseFloat(s.opacity);
       var r = el.getBoundingClientRect();
       var isLarge = r.width > window.innerWidth * 0.3 && r.height > window.innerHeight * 0.3;
-      /* Invisible or nearly-invisible large overlay */
-      if (isLarge && opacity <= 0.15) { el.remove(); return; }
+      var isFullScreen = r.width > window.innerWidth * 0.8 && r.height > window.innerHeight * 0.8;
+
+      /* Full-screen overlay iframes (ad takeovers) */
+      if (el.tagName === 'IFRAME' && isFullScreen && z > 10) { el.remove(); return; }
+
+      /* Invisible or nearly-invisible large overlay (z > 10 is enough) */
+      if (isLarge && opacity <= 0.15 && z > 10) { el.remove(); return; }
+      /* Large overlay with very high z-index regardless of opacity */
+      if (isLarge && z > 9000) {
+        var cls = (el.className || '').toLowerCase();
+        var id = (el.id || '').toLowerCase();
+        /* Don't remove modals/menus that seem legitimate */
+        if (cls.indexOf('modal') === -1 && cls.indexOf('menu') === -1 &&
+            cls.indexOf('nav') === -1 && cls.indexOf('player') === -1 &&
+            id.indexOf('player') === -1) {
+          el.remove(); return;
+        }
+      }
       /* Transparent <a> covering the viewport (classic clickjack) */
-      if (el.tagName === 'A' && isLarge && z > 100) { el.remove(); return; }
+      if (el.tagName === 'A' && isLarge && z > 50) { el.remove(); return; }
+      /* Small transparent overlays positioned over interactive elements */
+      if (el.tagName === 'A' && opacity <= 0.01 && z > 50) { el.remove(); return; }
+      /* Zero-size iframes used for tracking */
+      if (el.tagName === 'IFRAME' && (r.width <= 1 || r.height <= 1)) { el.remove(); return; }
     });
+  }
+
+  /* ══ First-click hijack protection ══
+   * Streaming sites register document-level click handlers that redirect
+   * the FIRST click to an ad, then let subsequent clicks through.
+   * We detect this by checking if the click target’s intended destination
+   * differs from where the page tries to navigate. */
+  var __rlCurrentHost = location.hostname;
+  function isSameSite(url) {
+    if (!url) return true;
+    try {
+      var u = new URL(url, location.href);
+      /* Same host, or relative URL */
+      return u.hostname === __rlCurrentHost;
+    } catch(_) { return true; }
   }
 
   /* ══ Capture-phase click guard ══ */
@@ -906,24 +1112,113 @@ video *,
     }
   }, true);
 
+  /* ══ Mousedown/pointerdown guard — block ad opens on press ══ */
+  ['mousedown', 'pointerdown', 'mouseup', 'pointerup', 'auxclick'].forEach(function(evt) {
+    document.addEventListener(evt, function(e) {
+      var t = e.target;
+      if (!t) return;
+      /* If click target is an invisible/transparent overlay, block it */
+      try {
+        var s = getComputedStyle(t);
+        if (parseFloat(s.opacity) < 0.1 &&
+            t.tagName !== 'VIDEO' && t.tagName !== 'INPUT' &&
+            t.tagName !== 'BUTTON' && t.tagName !== 'SELECT') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          return;
+        }
+      } catch(_) {}
+    }, true);
+  });
+
+  /* ══ Strip ALL document/body click listeners that sites add for popunders ══ */
+  (function() {
+    var origAddELDoc = EventTarget.prototype.addEventListener;
+    var HIJACK_EVENTS = ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'auxclick', 'contextmenu'];
+    EventTarget.prototype.addEventListener = function(type, fn, opts) {
+      if (type === 'beforeunload' && this === window) return;
+      /* Block sites from adding click/mouse hijack listeners to document, body, html */
+      if (HIJACK_EVENTS.indexOf(type) !== -1 &&
+          (this === document || this === document.body || this === document.documentElement || this === window)) {
+        /* Allow our own RL Caster listeners (they set __rlCaster flag) */
+        if (fn && fn.__rlCaster) {
+          return origAddELDoc.call(this, type, fn, opts);
+        }
+        /* Allow legitimate-looking handlers (e.g. frameworks that need document-level delegation) */
+        var fnStr = '';
+        try { fnStr = fn.toString().substring(0, 500).toLowerCase(); } catch(_) {}
+        if (fnStr.indexOf('window.open') !== -1 || fnStr.indexOf('location.href') !== -1 ||
+            fnStr.indexOf('location.assign') !== -1 || fnStr.indexOf('location.replace') !== -1 ||
+            fnStr.indexOf('popup') !== -1 || fnStr.indexOf('popunder') !== -1 ||
+            fnStr.indexOf('redirect') !== -1 || fnStr.indexOf('clickunder') !== -1 ||
+            fnStr.indexOf('.href=') !== -1 || fnStr.indexOf('zone_id') !== -1 ||
+            fnStr.indexOf('zoneid') !== -1 || fnStr.indexOf('ad_url') !== -1) {
+          return; /* block: this is a hijack handler */
+        }
+      }
+      return origAddELDoc.call(this, type, fn, opts);
+    };
+  })();
+
   /* ══ Sanitise ad-injected event handlers ══ */
   function sanitizeLinks() {
     /* Remove onclick from body/html (common popunder technique) */
     var body = document.body, html = document.documentElement;
-    if (body && body.getAttribute('onclick')) body.removeAttribute('onclick');
-    if (html && html.getAttribute('onclick')) html.removeAttribute('onclick');
+    if (body) {
+      if (body.getAttribute('onclick')) body.removeAttribute('onclick');
+      if (body.getAttribute('onmousedown')) body.removeAttribute('onmousedown');
+      if (body.getAttribute('onpointerdown')) body.removeAttribute('onpointerdown');
+      body.onclick = null;
+      body.onmousedown = null;
+      body.onmouseup = null;
+      body.onpointerdown = null;
+      body.onpointerup = null;
+    }
+    if (html) {
+      if (html.getAttribute('onclick')) html.removeAttribute('onclick');
+      if (html.getAttribute('onmousedown')) html.removeAttribute('onmousedown');
+      html.onclick = null;
+      html.onmousedown = null;
+      html.onmouseup = null;
+    }
 
-    /* Remove suspicious onclick / pointer handlers from elements */
-    document.querySelectorAll('[onclick], [onmousedown], [onmouseup], [onpointerdown], [onpointerup]').forEach(function(el) {
+    /* Remove suspicious inline handlers from ALL elements */
+    document.querySelectorAll('[onclick], [onmousedown], [onmouseup], [onpointerdown], [onpointerup], [ontouchstart], [ontouchend]').forEach(function(el) {
       if (isVideoPlayer(el)) return;
-      ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup'].forEach(function(attr) {
+      /* Keep handlers on actual interactive elements like nav links, buttons */
+      var tag = el.tagName.toLowerCase();
+      if (tag === 'input' || tag === 'select' || tag === 'textarea') return;
+      ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup', 'ontouchstart', 'ontouchend'].forEach(function(attr) {
         var val = (el.getAttribute(attr) || '').toLowerCase();
         if (val.indexOf('window.open') !== -1 || val.indexOf('location') !== -1 ||
             val.indexOf('redirect') !== -1 || val.indexOf('popup') !== -1 ||
-            val.indexOf('popunder') !== -1) {
+            val.indexOf('popunder') !== -1 || val.indexOf('void(0)') !== -1 ||
+            val.indexOf('zone_id') !== -1 || val.indexOf('window.location') !== -1) {
           el.removeAttribute(attr);
+          el[attr.replace('on', '')] = null;
         }
       });
+    });
+
+    /* Remove all <a> tags that are purely ad wrappers (cover large areas, no real href) */
+    document.querySelectorAll('a').forEach(function(a) {
+      if (!a.href) return;
+      try {
+        var r = a.getBoundingClientRect();
+        /* Large invisible ad-link overlays */
+        if (r.width > window.innerWidth * 0.3 && r.height > window.innerHeight * 0.3) {
+          var s = getComputedStyle(a);
+          if (s.position === 'fixed' || s.position === 'absolute') {
+            a.remove();
+            return;
+          }
+        }
+        /* Ad redirect links disguised as something else */
+        if (isAdRedirect(a.href)) {
+          a.removeAttribute('href');
+          a.style.pointerEvents = 'none';
+        }
+      } catch(_) {}
     });
   }
 
@@ -948,12 +1243,30 @@ video *,
     } catch(_) {}
   })();
 
-  /* ══ Prevent beforeunload abuse ══ */
+  /* ══ Block setTimeout/setInterval ad redirects ══ */
   (function() {
-    var origAddEL = EventTarget.prototype.addEventListener;
-    EventTarget.prototype.addEventListener = function(type, fn, opts) {
-      if (type === 'beforeunload' && this === window) return;
-      return origAddEL.call(this, type, fn, opts);
+    var origSetTimeout = window.setTimeout;
+    var origSetInterval = window.setInterval;
+    window.setTimeout = function(fn, delay) {
+      if (typeof fn === 'string') {
+        var lower = fn.toLowerCase();
+        if (lower.indexOf('window.open') !== -1 || lower.indexOf('location.href') !== -1 ||
+            lower.indexOf('location.assign') !== -1 || lower.indexOf('location.replace') !== -1 ||
+            lower.indexOf('popup') !== -1 || lower.indexOf('popunder') !== -1) {
+          return 0;
+        }
+      }
+      return origSetTimeout.apply(window, arguments);
+    };
+    window.setInterval = function(fn, delay) {
+      if (typeof fn === 'string') {
+        var lower = fn.toLowerCase();
+        if (lower.indexOf('window.open') !== -1 || lower.indexOf('location') !== -1 ||
+            lower.indexOf('popup') !== -1 || lower.indexOf('popunder') !== -1) {
+          return 0;
+        }
+      }
+      return origSetInterval.apply(window, arguments);
     };
   })();
 
@@ -962,15 +1275,17 @@ video *,
   removeClickjackOverlays();
   sanitizeLinks();
   blockMetaRefresh();
-  setTimeout(nuke, 300);
-  setTimeout(nuke, 800);
-  setTimeout(nuke, 1500);
-  setTimeout(nuke, 3000);
-  setTimeout(nuke, 6000);
+  setTimeout(nuke, 150);
+  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 300);
+  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 600);
+  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 1000);
+  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 1500);
   setTimeout(function() { nuke(); tryDismissConsent(); dismissAntiAdblock(); removeClickjackOverlays(); sanitizeLinks(); }, 2000);
+  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 3000);
   setTimeout(function() { tryDismissConsent(); dismissAntiAdblock(); removeClickjackOverlays(); sanitizeLinks(); blockMetaRefresh(); }, 4000);
+  setTimeout(function() { nuke(); removeClickjackOverlays(); sanitizeLinks(); }, 6000);
   setInterval(handleYouTubeAds, 500); /* YouTube ads can appear at any time */
-  setInterval(function() { removeClickjackOverlays(); sanitizeLinks(); }, 2500);
+  setInterval(function() { removeClickjackOverlays(); sanitizeLinks(); }, 1500);
 
   /* ══ MutationObserver for dynamic ads ══ */
   if (typeof MutationObserver !== 'undefined') {

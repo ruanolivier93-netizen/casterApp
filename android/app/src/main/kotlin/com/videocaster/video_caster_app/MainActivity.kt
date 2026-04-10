@@ -52,6 +52,25 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // ── Cast foreground service channel ─────────────────────────────
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "com.videocaster/foreground"
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "start" -> {
+                    val title = call.argument<String>("title") ?: "Casting video"
+                    CastForegroundService.start(this, title)
+                    result.success(true)
+                }
+                "stop" -> {
+                    CastForegroundService.stop(this)
+                    result.success(true)
+                }
+                else -> result.notImplemented()
+            }
+        }
+
         // ── Share intent channel ─────────────────────────────────────────
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
