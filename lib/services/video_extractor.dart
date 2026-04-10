@@ -16,6 +16,18 @@ class VideoExtractorService {
 
     final host = uri.host.toLowerCase();
     if (host.contains('youtube.com') || host.contains('youtu.be') || host.contains('m.youtube.com')) {
+      // Validate that the URL actually contains a video identifier.
+      final hasVideoId = uri.queryParameters.containsKey('v') ||
+          host.contains('youtu.be') && uri.pathSegments.isNotEmpty ||
+          uri.path.contains('/shorts/') ||
+          uri.path.contains('/embed/') ||
+          uri.path.contains('/live/');
+      if (!hasVideoId) {
+        throw Exception(
+          'This YouTube URL does not contain a video. '
+          'Please paste a link to a specific video.',
+        );
+      }
       return _extractYouTube(url);
     }
 

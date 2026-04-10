@@ -11,6 +11,7 @@ import '../services/stream_proxy.dart';
 import '../services/chromecast_service.dart';
 import '../services/subtitle_service.dart';
 import '../services/download_service.dart';
+import '../providers/queue_provider.dart';
 
 // ── Singleton services ────────────────────────────────────────────────────────────────────
 
@@ -25,10 +26,16 @@ final downloadServiceProvider = Provider((_) => DownloadService());
 
 class AppSettings {
   final bool routeThroughPhone;
-  const AppSettings({this.routeThroughPhone = true});
+  final String openSubtitlesApiKey;
+  const AppSettings({this.routeThroughPhone = true, this.openSubtitlesApiKey = ''});
 
-  AppSettings copyWith({bool? routeThroughPhone}) =>
-      AppSettings(routeThroughPhone: routeThroughPhone ?? this.routeThroughPhone);
+  bool get hasSubtitleKey => openSubtitlesApiKey.isNotEmpty;
+
+  AppSettings copyWith({bool? routeThroughPhone, String? openSubtitlesApiKey}) =>
+      AppSettings(
+        routeThroughPhone: routeThroughPhone ?? this.routeThroughPhone,
+        openSubtitlesApiKey: openSubtitlesApiKey ?? this.openSubtitlesApiKey,
+      );
 }
 
 class SettingsNotifier extends StateNotifier<AppSettings> {
@@ -37,11 +44,13 @@ class SettingsNotifier extends StateNotifier<AppSettings> {
   }
 
   static const _keyRouteThrough = 'route_through_phone';
+  static const _keySubtitleApiKey = 'opensubtitles_api_key';
 
   Future<void> _load() async {
     final prefs = await SharedPreferences.getInstance();
     state = AppSettings(
       routeThroughPhone: prefs.getBool(_keyRouteThrough) ?? true,
+      openSubtitlesApiKey: prefs.getString(_keySubtitleApiKey) ?? '',
     );
   }
 
@@ -50,6 +59,12 @@ class SettingsNotifier extends StateNotifier<AppSettings> {
     state = state.copyWith(routeThroughPhone: newValue);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_keyRouteThrough, newValue);
+  }
+
+  Future<void> setSubtitleApiKey(String key) async {
+    state = state.copyWith(openSubtitlesApiKey: key.trim());
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString(_keySubtitleApiKey, key.trim());
   }
 }
 
@@ -248,12 +263,17 @@ class CastError extends CastState {
 }
 
 class CastNotifier extends StateNotifier<CastState> {
-  CastNotifier(this._dlna, this._chromecast, this._proxy) : super(const CastIdle());
+  CastNotifier(this._dlna, this._chromecast, this._proxy, {this.onVideoFinished}) : super(const CastIdle());
   final DlnaService _dlna;
   final ChromecastService _chromecast;
   final StreamProxyService _proxy;
 
+  /// Called when a video finishes naturally (not user-stopped).
+  /// Used for auto-play-next-in-queue.
+  final Future<void> Function()? onVideoFinished;
+
   Timer? _progressTimer;
+  Timer? _sleepTimer;
   Duration _position = Duration.zero;
   Duration _totalDuration = Duration.zero;
   int _pollFailures = 0;
@@ -273,6 +293,7 @@ class CastNotifier extends StateNotifier<CastState> {
     try {
       String castUrl;
       String? subtitleUrl;
+      String? contentType;
 
       if (routeThroughPhone) {
         final baseUrl = await _proxy.start(
@@ -284,6 +305,8 @@ class CastNotifier extends StateNotifier<CastState> {
         }
         castUrl = '$baseUrl/stream';
         if (subtitleSrt != null) subtitleUrl = '$baseUrl/subtitle.srt';
+        // Use the MIME type from the original URL, not the proxy URL.
+        contentType = _proxy.originalMimeType;
       } else {
         castUrl = format.url;
       }
@@ -294,12 +317,14 @@ class CastNotifier extends StateNotifier<CastState> {
         await _chromecast.loadMedia(
           url: castUrl,
           title: title,
+          contentType: contentType ?? _guessChromecastMime(format.url),
           subtitleUrl: subtitleUrl,
         );
       } else {
         // ── DLNA flow ──
         await _dlna.setUri(device, castUrl, title,
-            subtitleUrl: subtitleUrl, durationSeconds: durationSeconds);
+            subtitleUrl: subtitleUrl, durationSeconds: durationSeconds,
+            contentType: contentType);
         await _dlna.play(device);
       }
 
@@ -378,7 +403,7 @@ class CastNotifier extends StateNotifier<CastState> {
     _progressTimer?.cancel();
     _pollFailures = 0;
     _progressTimer = Timer.periodic(const Duration(seconds: 2), (_) async {
-      if (state is! CastPlaying) {
+      if (!mounted || state is! CastPlaying) {
         _progressTimer?.cancel();
         return;
       }
@@ -392,7 +417,7 @@ class CastNotifier extends StateNotifier<CastState> {
 
           switch (status.state) {
             case 'IDLE':
-              await stop();
+              await _onNaturalStop();
             case 'PAUSED':
               final s = state;
               if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
@@ -410,7 +435,7 @@ class CastNotifier extends StateNotifier<CastState> {
           switch (info.transportState) {
             case 'STOPPED':
             case 'NO_MEDIA_PRESENT':
-              await stop();
+              await _onNaturalStop();
             case 'PAUSED_PLAYBACK':
               final s = state;
               if (s is CastPlaying && !s.isPaused) state = s.copyWith(isPaused: true);
@@ -421,24 +446,104 @@ class CastNotifier extends StateNotifier<CastState> {
         }
       } catch (_) {
         _pollFailures++;
-        if (_pollFailures >= 5) _progressTimer?.cancel();
+        // Allow more failures before giving up — networks can be flaky.
+        // After 15 consecutive failures (~30 seconds), stop polling.
+        if (_pollFailures >= 15) {
+          _progressTimer?.cancel();
+          // Don't auto-stop — the stream might still be playing.
+          // Just stop updating progress.
+        }
       }
     });
+  }
+
+  /// Called when the video ends naturally. Tries auto-play-next, else stops.
+  Future<void> _onNaturalStop() async {
+    if (onVideoFinished != null) {
+      await onVideoFinished!();
+    } else {
+      await stop();
+    }
+  }
+
+  /// Set a sleep timer that auto-stops casting after [duration].
+  void setSleepTimer(Duration duration) {
+    _sleepTimer?.cancel();
+    if (duration == Duration.zero) return;
+    _sleepTimer = Timer(duration, () {
+      stop();
+    });
+  }
+
+  /// Cancel any active sleep timer.
+  void cancelSleepTimer() {
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+  }
+
+  /// Whether a sleep timer is currently active.
+  bool get hasSleepTimer => _sleepTimer?.isActive ?? false;
+
+  /// MIME type helper for Chromecast (needs it in loadMedia).
+  static String _guessChromecastMime(String url) {
+    final lower = url.toLowerCase().split('?').first;
+    if (lower.contains('.m3u8')) return 'application/x-mpegurl';
+    if (lower.endsWith('.mpd')) return 'application/dash+xml';
+    if (lower.endsWith('.webm')) return 'video/webm';
+    if (lower.endsWith('.mkv')) return 'video/x-matroska';
+    if (lower.endsWith('.avi')) return 'video/x-msvideo';
+    if (lower.endsWith('.mov')) return 'video/quicktime';
+    if (lower.endsWith('.ts')) return 'video/mp2t';
+    if (lower.endsWith('.mp3')) return 'audio/mpeg';
+    if (lower.endsWith('.m4a') || lower.endsWith('.aac')) return 'audio/mp4';
+    if (lower.endsWith('.flac')) return 'audio/flac';
+    return 'video/mp4';
   }
 
   @override
   void dispose() {
     _progressTimer?.cancel();
+    _sleepTimer?.cancel();
     super.dispose();
   }
 }
 
 final castProvider = StateNotifierProvider<CastNotifier, CastState>(
-  (ref) => CastNotifier(
-    ref.watch(dlnaServiceProvider),
-    ref.watch(chromecastServiceProvider),
-    ref.watch(streamProxyProvider),
-  ),
+  (ref) {
+    late final CastNotifier notifier;
+    notifier = CastNotifier(
+      ref.watch(dlnaServiceProvider),
+      ref.watch(chromecastServiceProvider),
+      ref.watch(streamProxyProvider),
+      onVideoFinished: () async {
+        final queue = ref.read(queueProvider.notifier);
+        final next = queue.advance();
+        if (next != null) {
+          // Auto-extract and cast the next queue item
+          final extractor = ref.read(videoExtractorProvider);
+          try {
+            final info = await extractor.extract(next.url);
+            if (info.formats.isNotEmpty) {
+              final device = ref.read(selectedDeviceProvider);
+              final settings = ref.read(settingsProvider);
+              if (device != null) {
+                await notifier.cast(
+                  device: device,
+                  format: info.formats.first,
+                  title: info.title,
+                  routeThroughPhone: settings.routeThroughPhone,
+                );
+                return;
+              }
+            }
+          } catch (_) {}
+        }
+        // No next item or failed — just stop
+        await notifier.stop();
+      },
+    );
+    return notifier;
+  },
 );
 
 // Progress is kept in the notifier; expose via a simple provider

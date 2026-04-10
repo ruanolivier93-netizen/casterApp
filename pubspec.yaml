@@ -18,11 +18,14 @@ dependencies:
   cached_network_image: ^3.3.1
   wakelock_plus: ^1.2.1
   webview_flutter: ^4.10.0
+  webview_flutter_android: ^4.0.0
+  webview_flutter_wkwebview: ^3.20.0
   multicast_dns: ^0.3.2+6
   file_picker: ^8.0.0
   path_provider: ^2.1.0
   dio: ^5.4.0
   permission_handler: ^11.3.0
+  receive_sharing_intent: ^1.8.1
 
 dev_dependencies:
   flutter_test:

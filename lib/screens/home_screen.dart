@@ -624,9 +624,14 @@ class _CastControlsState extends ConsumerState<_CastControls> {
     if (_volumeLoading || _volumeFetched) return;
     setState(() => _volumeLoading = true);
     try {
-      final v = await ref.read(dlnaServiceProvider).getVolume(device);
-      _volumeFetched = true;
-      if (mounted && v != null) setState(() => _volume = v.toDouble());
+      if (device.protocol == CastProtocol.chromecast) {
+        _volumeFetched = true;
+        if (mounted) setState(() => _volume ??= 50);
+      } else {
+        final v = await ref.read(dlnaServiceProvider).getVolume(device);
+        _volumeFetched = true;
+        if (mounted && v != null) setState(() => _volume = v.toDouble());
+      }
     } finally {
       if (mounted) setState(() => _volumeLoading = false);
     }
@@ -634,7 +639,11 @@ class _CastControlsState extends ConsumerState<_CastControls> {
 
   Future<void> _setVolume(DlnaDevice device, double v) async {
     setState(() => _volume = v);
-    await ref.read(dlnaServiceProvider).setVolume(device, v.round());
+    if (device.protocol == CastProtocol.chromecast) {
+      await ref.read(chromecastServiceProvider).setVolume(v / 100);
+    } else {
+      await ref.read(dlnaServiceProvider).setVolume(device, v.round());
+    }
   }
 
   @override
@@ -683,7 +692,7 @@ class _CastControlsState extends ConsumerState<_CastControls> {
     }
 
     if (castState is CastPlaying) {
-      if (!_volumeFetched && castState.device.renderingControlUrl != null) {
+      if (!_volumeFetched) {
         WidgetsBinding.instance.addPostFrameCallback(
           (_) => _fetchVolume(castState.device),
         );
@@ -777,7 +786,7 @@ class _CastControlsState extends ConsumerState<_CastControls> {
               ),
 
               // Volume
-              if (castState.device.renderingControlUrl != null) ...[
+              ...[
                 const SizedBox(height: 8),
                 Row(
                   children: [
@@ -795,6 +804,10 @@ class _CastControlsState extends ConsumerState<_CastControls> {
                   ],
                 ),
               ],
+
+              // Sleep timer
+              const SizedBox(height: 4),
+              _SleepTimerButton(),
             ],
           ),
         ),
@@ -1058,16 +1071,26 @@ class _SubtitleSearchSectionState
   List<SubtitleResult>? _results;
   bool _loading = false;
   String? _error;
+  bool _isKeyError = false;
 
   Future<void> _search() async {
+    final settings = ref.read(settingsProvider);
+    final service = ref.read(subtitleServiceProvider);
+    // Apply the API key from settings before each search
+    service.setApiKey(settings.openSubtitlesApiKey);
+
     setState(() {
       _loading = true;
       _error = null;
+      _isKeyError = false;
     });
     try {
-      final service = ref.read(subtitleServiceProvider);
       final results = await service.search(query: widget.title);
       if (mounted) setState(() => _results = results);
+    } on SubtitleApiKeyMissing catch (e) {
+      if (mounted) setState(() { _error = e.toString(); _isKeyError = true; });
+    } on SubtitleApiKeyInvalid catch (e) {
+      if (mounted) setState(() { _error = e.toString(); _isKeyError = true; });
     } catch (e) {
       if (mounted) setState(() => _error = e.toString());
     } finally {
@@ -1106,6 +1129,7 @@ class _SubtitleSearchSectionState
   @override
   Widget build(BuildContext context) {
     final cs = Theme.of(context).colorScheme;
+    final hasKey = ref.watch(settingsProvider).hasSubtitleKey;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -1133,9 +1157,40 @@ class _SubtitleSearchSectionState
               ),
           ],
         ),
-        if (_error != null) ...[
+        if (!hasKey && _error == null && _results == null) ...[
           const SizedBox(height: 4),
-          Text(_error!, style: TextStyle(fontSize: 12, color: cs.error)),
+          Text(
+            'Add your free OpenSubtitles API key in Settings to search subtitles.',
+            style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
+          ),
+        ],
+        if (_error != null) ...[
+          if (_isKeyError) ...[
+            const SizedBox(height: 4),
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: cs.tertiaryContainer.withAlpha(80),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(_error!, style: TextStyle(fontSize: 12, color: cs.onSurface)),
+                  const SizedBox(height: 6),
+                  Text(
+                    '1. Go to opensubtitles.com/en/consumers\n'
+                    '2. Create a free account & register a consumer\n'
+                    '3. Paste your API key in Settings \u2192 OpenSubtitles API Key',
+                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                  ),
+                ],
+              ),
+            ),
+          ] else ...[
+            const SizedBox(height: 4),
+            Text(_error!, style: TextStyle(fontSize: 12, color: cs.error)),
+          ],
         ],
         if (_results != null && _results!.isEmpty) ...[
           const SizedBox(height: 4),
@@ -1166,14 +1221,115 @@ class _SubtitleSearchSectionState
   }
 }
 
+// ── Sleep Timer Button ──────────────────────────────────────────────────────
+
+class _SleepTimerButton extends ConsumerWidget {
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final cs = Theme.of(context).colorScheme;
+    final castNotifier = ref.read(castProvider.notifier);
+    final isActive = castNotifier.hasSleepTimer;
+
+    return Align(
+      alignment: Alignment.centerLeft,
+      child: TextButton.icon(
+        icon: Icon(
+          isActive ? Icons.timer : Icons.timer_outlined,
+          size: 16,
+          color: isActive ? cs.primary : cs.onSurfaceVariant,
+        ),
+        label: Text(
+          isActive ? 'Sleep timer on' : 'Sleep timer',
+          style: TextStyle(
+            fontSize: 12,
+            color: isActive ? cs.primary : cs.onSurfaceVariant,
+          ),
+        ),
+        onPressed: () {
+          if (isActive) {
+            castNotifier.cancelSleepTimer();
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Sleep timer cancelled'), duration: Duration(seconds: 2)),
+            );
+          } else {
+            _showTimerPicker(context, castNotifier);
+          }
+        },
+      ),
+    );
+  }
+
+  void _showTimerPicker(BuildContext context, CastNotifier notifier) {
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return SafeArea(
+          child: Padding(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                const Text('Sleep Timer',
+                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+                const SizedBox(height: 12),
+                ...[15, 30, 45, 60, 90, 120].map((m) => ListTile(
+                      dense: true,
+                      leading: const Icon(Icons.timer, size: 20),
+                      title: Text(m >= 60 ? '${m ~/ 60} hour${m > 60 ? 's' : ''}${m % 60 > 0 ? ' ${m % 60} min' : ''}' : '$m minutes'),
+                      onTap: () {
+                        notifier.setSleepTimer(Duration(minutes: m));
+                        Navigator.pop(ctx);
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: Text('Casting will stop in $m minutes'),
+                            duration: const Duration(seconds: 3),
+                          ),
+                        );
+                      },
+                    )),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
 // ── Settings Sheet ──────────────────────────────────────────────────────────
 
-class _SettingsSheet extends ConsumerWidget {
+class _SettingsSheet extends ConsumerStatefulWidget {
   const _SettingsSheet();
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<_SettingsSheet> createState() => _SettingsSheetState();
+}
+
+class _SettingsSheetState extends ConsumerState<_SettingsSheet> {
+  late TextEditingController _apiKeyController;
+
+  @override
+  void initState() {
+    super.initState();
+    _apiKeyController = TextEditingController(
+      text: ref.read(settingsProvider).openSubtitlesApiKey,
+    );
+  }
+
+  @override
+  void dispose() {
+    _apiKeyController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final settings = ref.watch(settingsProvider);
+    final cs = Theme.of(context).colorScheme;
     return Padding(
       padding: EdgeInsets.fromLTRB(
           20, 20, 20, MediaQuery.of(context).viewInsets.bottom + 20),
@@ -1192,6 +1348,53 @@ class _SettingsSheet extends ConsumerWidget {
             ),
             value: settings.routeThroughPhone,
             onChanged: (_) => ref.read(settingsProvider.notifier).toggle(),
+          ),
+          const Divider(),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.subtitles_outlined),
+            title: const Text('OpenSubtitles API Key'),
+            subtitle: settings.hasSubtitleKey
+                ? Text('Key configured (${settings.openSubtitlesApiKey.substring(0, 4)}…)',
+                    style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant))
+                : Text('Not configured — subtitles won\u2019t work',
+                    style: TextStyle(fontSize: 12, color: cs.error)),
+          ),
+          TextField(
+            controller: _apiKeyController,
+            decoration: InputDecoration(
+              hintText: 'Paste your API key here',
+              hintStyle: const TextStyle(fontSize: 13),
+              isDense: true,
+              border: const OutlineInputBorder(),
+              suffixIcon: IconButton(
+                icon: Icon(Icons.check_circle,
+                    color: _apiKeyController.text.trim().isNotEmpty
+                        ? cs.primary
+                        : cs.outlineVariant),
+                onPressed: () {
+                  ref.read(settingsProvider.notifier)
+                      .setSubtitleApiKey(_apiKeyController.text);
+                  FocusScope.of(context).unfocus();
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text('API key saved'),
+                      duration: Duration(seconds: 2),
+                    ),
+                  );
+                },
+              ),
+            ),
+            style: const TextStyle(fontSize: 13),
+            onSubmitted: (v) {
+              ref.read(settingsProvider.notifier).setSubtitleApiKey(v);
+              FocusScope.of(context).unfocus();
+            },
+          ),
+          const SizedBox(height: 4),
+          Text(
+            'Free key: opensubtitles.com/en/consumers',
+            style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
           ),
           const Divider(),
           ListTile(

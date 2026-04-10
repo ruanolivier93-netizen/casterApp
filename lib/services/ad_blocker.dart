@@ -49,6 +49,37 @@ class AdBlocker {
     return false;
   }
 
+  /// Returns `true` if the URL looks like a popup, redirect, or affiliate ad.
+  /// Used for navigation-level blocking (complements [shouldBlock]).
+  static bool isPopupOrRedirect(String url) {
+    final lower = url.toLowerCase();
+    const patterns = [
+      // Affiliate / tracking query parameters
+      'click_id=', 'aff_id=', 'offer_id=', 'aff_sub=',
+      'clickid=', 'affid=', 'campaign_id=',
+      // Banner / zone ad serving
+      '?zoneid=', '&zoneid=', '?bannerid=', '&bannerid=',
+      // Ad redirect URL parameters
+      '?adurl=', '&adurl=', '?ad_url=', '&ad_url=',
+      // Google ad click tracking
+      '/aclk?', '/pagead/',
+      // CPA / smartlink paths
+      '/smartlink/', '/cpa/', '/cpl/', '/cpc/',
+      // Popup / popunder techniques
+      'popunder', 'clickunder', 'pop.js', 'popjs',
+      // Scam landing page patterns
+      '/lucky-visitor', '/claim-reward', '/spin-wheel', '/prize-winner',
+      'congratulations-you', 'you-have-won',
+      // URL shorteners used for ad redirects
+      'linkvertise.com', 'shrinkme.io', 'cpmlink.net',
+      'exe.io', 'fc.lc', 'za.gl',
+    ];
+    for (final p in patterns) {
+      if (lower.contains(p)) return true;
+    }
+    return false;
+  }
+
   static const _videoExtensions = [
     '.mp4', '.m4v', '.webm', '.mkv', '.avi', '.mov', '.flv', '.ts',
     '.3gp', '.wmv', '.ogv', '.m3u8', '.mpd', '.m4s', '.f4v',
@@ -692,30 +723,33 @@ video *,
     document.querySelectorAll('ytd-promoted-sparkles-web-renderer, ytd-promoted-video-renderer, ytd-display-ad-renderer, ytd-companion-slot-renderer, ytd-action-companion-ad-renderer, ytd-in-feed-ad-layout-renderer, ytd-ad-slot-renderer, ytd-banner-promo-renderer, ytd-merch-shelf-renderer, #player-ads, #masthead-ad').forEach(function(el) { el.remove(); });
   }
 
-  /* ══ Block window.open popups ══ */
-  (function() {
-    var origOpen = window.open;
-    window.open = function(url) {
-      /* Allow same-origin navigations but block cross-origin ad popups */
-      try {
-        if (url) {
-          var target = new URL(url, location.href);
-          if (target.hostname === location.hostname) {
-            return origOpen.apply(window, arguments);
-          }
-          /* Block known ad domains */
-          var host = target.hostname.toLowerCase();
-          var adHosts = ['doubleclick', 'googlesyndication', 'googleads', 'adnxs',
-            'popads', 'popcash', 'propellerads', 'clickadu', 'exoclick',
-            'trafficjunky', 'juicyads', 'hilltopads', 'trafficstars'];
-          for (var i = 0; i < adHosts.length; i++) {
-            if (host.indexOf(adHosts[i]) !== -1) return null;
-          }
-        }
-      } catch(_) {}
-      return origOpen.apply(window, arguments);
-    };
-  })();
+  /* ══ Block ALL window.open popups ══ */
+  window.open = function() { return null; };
+
+  /* ══ Ad-redirect URL detection (shared helper) ══ */
+  var AD_REDIR_PATTERNS = [
+    'doubleclick', 'googlesyndication', 'googleads', 'adnxs', 'adsrvr',
+    'popads', 'popcash', 'propellerads', 'clickadu', 'exoclick',
+    'trafficjunky', 'juicyads', 'hilltopads', 'trafficstars',
+    'adsterra', 'admaven', 'richpush', 'outbrain', 'taboola',
+    'mgid', 'revcontent', 'criteo', 'pubmatic', 'adform',
+    'amazon-adsystem', 'serving-sys', 'flashtalking',
+    'popunder', 'clicktrack', 'clickunder',
+    'linkvertise', 'shrinkme', 'cpmlink',
+    'adf.ly', 'ouo.io', 'bc.vc', 'sh.st', 'shorte.st', 'clk.sh',
+    '/aclk?', '/pagead/', 'click_id=', 'aff_id=', 'offer_id=',
+    'aff_sub=', '?zoneid=', '&zoneid=', '?bannerid=', '&bannerid=',
+    '?adurl=', '&adurl=', '/smartlink/', '/cpa/', '/cpl/',
+    'popunder', 'clickunder',
+  ];
+  function isAdRedirect(url) {
+    if (!url) return false;
+    var lower = url.toLowerCase();
+    for (var i = 0; i < AD_REDIR_PATTERNS.length; i++) {
+      if (lower.indexOf(AD_REDIR_PATTERNS[i]) !== -1) return true;
+    }
+    return false;
+  }
 
   /* ══ Abort ad-related property reads (scriptlet-style) ══ */
   (function() {
@@ -794,16 +828,130 @@ video *,
     } catch(_) {}
   })();
 
+  /* ══ Block location.assign / location.replace ad redirects ══ */
+  (function() {
+    try {
+      var origAssign = location.assign.bind(location);
+      var origReplace = location.replace.bind(location);
+      location.assign = function(url) {
+        if (isAdRedirect(url)) return;
+        origAssign(url);
+      };
+      location.replace = function(url) {
+        if (isAdRedirect(url)) return;
+        origReplace(url);
+      };
+    } catch(_) {}
+  })();
+
+  /* ══ Remove invisible clickjack overlays ══ */
+  function removeClickjackOverlays() {
+    document.querySelectorAll('div, a, span, section, aside').forEach(function(el) {
+      var s;
+      try { s = getComputedStyle(el); } catch(_) { return; }
+      if (s.position !== 'fixed' && s.position !== 'absolute') return;
+      if (isVideoPlayer(el)) return;
+      var z = parseInt(s.zIndex, 10) || 0;
+      if (z < 50) return;
+      var opacity = parseFloat(s.opacity);
+      var r = el.getBoundingClientRect();
+      var isLarge = r.width > window.innerWidth * 0.3 && r.height > window.innerHeight * 0.3;
+      /* Invisible or nearly-invisible large overlay */
+      if (isLarge && opacity <= 0.15) { el.remove(); return; }
+      /* Transparent <a> covering the viewport (classic clickjack) */
+      if (el.tagName === 'A' && isLarge && z > 100) { el.remove(); return; }
+    });
+  }
+
+  /* ══ Capture-phase click guard ══ */
+  document.addEventListener('click', function(e) {
+    var t = e.target;
+    if (!t) return;
+    /* Block clicks on invisible overlays */
+    try {
+      var s = getComputedStyle(t);
+      if (parseFloat(s.opacity) < 0.1 &&
+          t.tagName !== 'VIDEO' && t.tagName !== 'INPUT' &&
+          t.tagName !== 'BUTTON' && t.tagName !== 'SELECT' &&
+          t.tagName !== 'TEXTAREA') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        return;
+      }
+    } catch(_) {}
+    /* Block clicks on known ad-redirect links */
+    var anchor = t.closest ? t.closest('a') : null;
+    if (anchor && anchor.href && isAdRedirect(anchor.href)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+    }
+  }, true);
+
+  /* ══ Sanitise ad-injected event handlers ══ */
+  function sanitizeLinks() {
+    /* Remove onclick from body/html (common popunder technique) */
+    var body = document.body, html = document.documentElement;
+    if (body && body.getAttribute('onclick')) body.removeAttribute('onclick');
+    if (html && html.getAttribute('onclick')) html.removeAttribute('onclick');
+
+    /* Remove suspicious onclick / pointer handlers from elements */
+    document.querySelectorAll('[onclick], [onmousedown], [onmouseup], [onpointerdown], [onpointerup]').forEach(function(el) {
+      if (isVideoPlayer(el)) return;
+      ['onclick', 'onmousedown', 'onmouseup', 'onpointerdown', 'onpointerup'].forEach(function(attr) {
+        var val = (el.getAttribute(attr) || '').toLowerCase();
+        if (val.indexOf('window.open') !== -1 || val.indexOf('location') !== -1 ||
+            val.indexOf('redirect') !== -1 || val.indexOf('popup') !== -1 ||
+            val.indexOf('popunder') !== -1) {
+          el.removeAttribute(attr);
+        }
+      });
+    });
+  }
+
+  /* ══ Block meta-refresh redirects to ad URLs ══ */
+  function blockMetaRefresh() {
+    document.querySelectorAll('meta[http-equiv="refresh"]').forEach(function(m) {
+      var content = (m.getAttribute('content') || '').toLowerCase();
+      if (content.indexOf('url=') !== -1) {
+        var url = content.split('url=')[1];
+        if (url && isAdRedirect(url.trim())) m.remove();
+      }
+    });
+  }
+
+  /* ══ Prevent popunder via window.blur / window.focus tricks ══ */
+  (function() {
+    try {
+      Object.defineProperty(window, 'blur', {
+        value: function() {},
+        writable: false, configurable: false
+      });
+    } catch(_) {}
+  })();
+
+  /* ══ Prevent beforeunload abuse ══ */
+  (function() {
+    var origAddEL = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function(type, fn, opts) {
+      if (type === 'beforeunload' && this === window) return;
+      return origAddEL.call(this, type, fn, opts);
+    };
+  })();
+
   /* ══ Schedule execution ══ */
   nuke();
+  removeClickjackOverlays();
+  sanitizeLinks();
+  blockMetaRefresh();
   setTimeout(nuke, 300);
   setTimeout(nuke, 800);
   setTimeout(nuke, 1500);
   setTimeout(nuke, 3000);
   setTimeout(nuke, 6000);
-  setTimeout(function() { nuke(); tryDismissConsent(); dismissAntiAdblock(); }, 2000);
-  setTimeout(function() { tryDismissConsent(); dismissAntiAdblock(); }, 4000);
+  setTimeout(function() { nuke(); tryDismissConsent(); dismissAntiAdblock(); removeClickjackOverlays(); sanitizeLinks(); }, 2000);
+  setTimeout(function() { tryDismissConsent(); dismissAntiAdblock(); removeClickjackOverlays(); sanitizeLinks(); blockMetaRefresh(); }, 4000);
   setInterval(handleYouTubeAds, 500); /* YouTube ads can appear at any time */
+  setInterval(function() { removeClickjackOverlays(); sanitizeLinks(); }, 2500);
 
   /* ══ MutationObserver for dynamic ads ══ */
   if (typeof MutationObserver !== 'undefined') {
@@ -815,6 +963,8 @@ video *,
         nuke();
         dismissAntiAdblock();
         handleYouTubeAds();
+        removeClickjackOverlays();
+        sanitizeLinks();
       }, 250);
     }).observe(document.body || document.documentElement, {
       childList: true, subtree: true

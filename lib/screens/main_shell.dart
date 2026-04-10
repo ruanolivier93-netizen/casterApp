@@ -1,6 +1,9 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:receive_sharing_intent/receive_sharing_intent.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 import '../providers/app_state.dart';
 import '../widgets/mini_player.dart';
@@ -20,12 +23,47 @@ class _MainShellState extends ConsumerState<MainShell> {
   int _tabIndex = 0;
   bool _browserInitialised = false;
   WebViewController? _webController;
+  StreamSubscription? _shareSub;
+
+  @override
+  void initState() {
+    super.initState();
+    // Handle URL shared while app was closed
+    ReceiveSharingIntent.instance.getInitialMedia().then((list) {
+      _handleSharedMedia(list);
+    });
+    // Handle URL shared while app is running
+    _shareSub = ReceiveSharingIntent.instance.getMediaStream().listen(
+      _handleSharedMedia,
+    );
+  }
+
+  @override
+  void dispose() {
+    _shareSub?.cancel();
+    super.dispose();
+  }
+
+  void _handleSharedMedia(List<SharedMediaFile> files) {
+    if (files.isEmpty) return;
+    // Extract a URL from shared text
+    final text = files.first.path;
+    final urlMatch = RegExp(r'https?://\S+').firstMatch(text);
+    final url = urlMatch?.group(0) ?? text;
+    if (url.startsWith('http://') || url.startsWith('https://')) {
+      // Navigate to Cast tab and load the URL
+      setState(() => _tabIndex = 0);
+      ref.read(browserCastUrlProvider.notifier).state = url;
+      ref.read(videoProvider.notifier).extract(url);
+    }
+  }
 
   /// Called from BrowserScreen when the user taps "Cast this page".
   void _onCastUrlFromBrowser(String url) {
+    // Put the URL in the provider so the Cast tab also picks it up,
+    // but do NOT switch tabs — the browser has its own cast controls.
     ref.read(browserCastUrlProvider.notifier).state = url;
     ref.read(selectedFormatProvider.notifier).state = null;
-    ref.read(selectedDeviceProvider.notifier).state = null;
 
     final uri = Uri.tryParse(url);
     final host = uri?.host.toLowerCase() ?? '';
@@ -37,16 +75,13 @@ class _MainShellState extends ConsumerState<MainShell> {
 
     if (host.contains('youtube.com') || host.contains('youtu.be') ||
         host.contains('m.youtube.com')) {
-      // YouTube — use full extractor for quality picker
       ref.read(videoProvider.notifier).extract(url);
     } else if (videoExts.any((e) => path.contains(e))) {
-      // Direct video URL — skip HEAD check, load immediately
       ref.read(videoProvider.notifier).loadDirect(url);
     } else {
-      // Unknown — try extraction
       ref.read(videoProvider.notifier).extract(url);
     }
-    setState(() => _tabIndex = 0);
+    // Stay on the browser tab — cast panel shows inline.
   }
 
   @override

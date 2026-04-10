@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:http/http.dart' as http;
 import 'package:xml/xml.dart';
 import '../models/dlna_device.dart';
+import 'multicast_lock.dart';
 
 class PositionInfo {
   final Duration position;
@@ -24,29 +25,35 @@ class DlnaService {
   static const _searchTargets = [
     'urn:schemas-upnp-org:device:MediaRenderer:1',
     'urn:schemas-upnp-org:service:AVTransport:1',
+    'ssdp:all',
   ];
 
   // ── Device Discovery ────────────────────────────────────────────────────────
 
   /// Discovers DLNA renderers. Returns results as they're found up to [timeout].
-  /// Default timeout reduced to 4 seconds for snappier UX.
-  Future<List<DlnaDevice>> discover({Duration timeout = const Duration(seconds: 4)}) async {
-    final devices = <DlnaDevice>[];
-    final seen = <String>{};
-    await Future.wait(
-      _searchTargets.map((target) => _ssdpSearch(
-            searchTarget: target,
-            timeout: timeout,
-            seen: seen,
-            devices: devices,
-          )),
-    );
-    return devices;
+  Future<List<DlnaDevice>> discover({Duration timeout = const Duration(seconds: 6)}) async {
+    await MulticastLock.acquire();
+    try {
+      final devices = <DlnaDevice>[];
+      final seen = <String>{};
+      await Future.wait(
+        _searchTargets.map((target) => _ssdpSearch(
+              searchTarget: target,
+              timeout: timeout,
+              seen: seen,
+              devices: devices,
+            )),
+      );
+      return devices;
+    } finally {
+      await MulticastLock.release();
+    }
   }
 
   /// Stream-based discovery that yields devices as they arrive.
   /// This is used for *live updating* UI — devices appear immediately.
-  Stream<DlnaDevice> discoverStream({Duration timeout = const Duration(seconds: 5)}) async* {
+  Stream<DlnaDevice> discoverStream({Duration timeout = const Duration(seconds: 8)}) async* {
+    await MulticastLock.acquire();
     final controller = StreamController<DlnaDevice>();
     final seen = <String>{};
 
@@ -56,6 +63,10 @@ class DlnaService {
         socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
         socket.multicastHops = 4;
         socket.broadcastEnabled = true;
+        // Join the SSDP multicast group so replies can be received.
+        try {
+          socket.joinMulticast(InternetAddress(_ssdpAddress));
+        } catch (_) {}
 
         final message = utf8.encode(
           'M-SEARCH * HTTP/1.1\r\n'
@@ -118,6 +129,7 @@ class DlnaService {
 
     await searchFuture;
     await controller.close();
+    await MulticastLock.release();
   }
 
   Future<void> _ssdpSearch({
@@ -131,12 +143,15 @@ class DlnaService {
       socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
       socket.multicastHops = 4;
       socket.broadcastEnabled = true;
+      try {
+        socket.joinMulticast(InternetAddress(_ssdpAddress));
+      } catch (_) {}
 
       final message = utf8.encode(
         'M-SEARCH * HTTP/1.1\r\n'
         'HOST: $_ssdpAddress:$_ssdpPort\r\n'
         'MAN: "ssdp:discover"\r\n'
-        'MX: 2\r\n'
+        'MX: 3\r\n'
         'ST: $searchTarget\r\n'
         '\r\n',
       );
@@ -231,9 +246,11 @@ class DlnaService {
   Future<void> setUri(DlnaDevice device, String uri, String title, {
     String? subtitleUrl,
     int? durationSeconds,
+    String? contentType,
   }) async {
     final metadata = _buildDIDL(title, uri,
-        subtitleUrl: subtitleUrl, durationSeconds: durationSeconds);
+        subtitleUrl: subtitleUrl, durationSeconds: durationSeconds,
+        contentType: contentType);
     await _soap(
       device.controlUrl,
       'SetAVTransportURI',
@@ -355,8 +372,9 @@ class DlnaService {
   String _buildDIDL(String title, String uri, {
     String? subtitleUrl,
     int? durationSeconds,
+    String? contentType,
   }) {
-    final mime = _mimeType(uri);
+    final mime = contentType ?? _mimeType(uri);
     final isAudio = mime.startsWith('audio/');
     final upnpClass = isAudio ? 'object.item.audioItem.musicTrack' : 'object.item.videoItem';
 

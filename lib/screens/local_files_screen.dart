@@ -35,7 +35,7 @@ class _LocalFilesScreenState extends ConsumerState<LocalFilesScreen> {
     if (file.path == null) return;
     // Use the proxy to serve the local file — the proxy can handle file:// URIs
     // through its stream forwarding, but for local files we create a direct path.
-    final fileUrl = 'file://${file.path}';
+    final fileUrl = Uri.file(file.path!).toString();
     ref.read(selectedFormatProvider.notifier).state = StreamFormat(
       id: 'local',
       label: file.name,

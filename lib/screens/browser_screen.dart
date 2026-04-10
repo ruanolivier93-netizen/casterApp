@@ -3,10 +3,13 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:webview_flutter/webview_flutter.dart';
+import 'package:webview_flutter_android/webview_flutter_android.dart';
+import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
 
 import '../services/ad_blocker.dart';
 import '../providers/bookmarks_history.dart';
 import '../providers/app_state.dart';
+import '../models/dlna_device.dart';
 
 /// Callback when user taps "Cast" on a detected video URL.
 typedef OnCastUrl = void Function(String url);
@@ -81,6 +84,11 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   double _progress = 0;
   bool _canGoBack = false;
   bool _canGoForward = false;
+  bool _desktopMode = false;
+
+  static const _desktopUA =
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+      'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
   final List<_DetectedVideo> _detectedVideos = [];
   bool _showBookmarks = true;
@@ -91,12 +99,26 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   @override
   void initState() {
     super.initState();
-    _controller = WebViewController()
+
+    // Platform-specific creation params for proper video playback support.
+    late final PlatformWebViewControllerCreationParams params;
+    if (WebViewPlatform.instance is WebKitWebViewPlatform) {
+      params = WebKitWebViewControllerCreationParams(
+        allowsInlineMediaPlayback: true,
+      );
+    } else {
+      params = const PlatformWebViewControllerCreationParams();
+    }
+
+    _controller = WebViewController.fromPlatformCreationParams(params)
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
       ..addJavaScriptChannel('VideoDetector', onMessageReceived: _onVideoDetected)
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
           if (AdBlocker.shouldBlock(request.url)) {
+            return NavigationDecision.prevent;
+          }
+          if (AdBlocker.isPopupOrRedirect(request.url)) {
             return NavigationDecision.prevent;
           }
           return NavigationDecision.navigate;
@@ -142,6 +164,13 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         },
       ))
       ..loadRequest(Uri.parse('https://www.google.com'));
+
+    // Android-specific: enable video playback without user gesture.
+    if (_controller.platform is AndroidWebViewController) {
+      final android = _controller.platform as AndroidWebViewController;
+      android.setMediaPlaybackRequiresUserGesture(false);
+    }
+
     widget.onControllerCreated?.call(_controller);
     _urlController.text = 'https://www.google.com';
   }
@@ -178,6 +207,16 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     }
     _controller.loadRequest(Uri.parse(url));
     _urlFocus.unfocus();
+  }
+
+  void _toggleDesktopMode() {
+    setState(() => _desktopMode = !_desktopMode);
+    if (_desktopMode) {
+      _controller.setUserAgent(_desktopUA);
+    } else {
+      _controller.setUserAgent(null); // revert to platform default
+    }
+    _controller.reload();
   }
 
   static String _escapeJsString(String s) {
@@ -354,7 +393,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                     ]),
                     const SizedBox(height: 4),
                     Text(
-                      'Tap a video to send it to the Cast tab for TV selection.',
+                      'Tap a video to cast it to your TV.',
                       style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant),
                     ),
                     const SizedBox(height: 8),
@@ -447,6 +486,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         children: [
           if (_showBookmarks) _buildBookmarksGrid(cs),
           Expanded(child: WebViewWidget(controller: _controller)),
+          // ── Inline Cast Panel ─────────────────────────────────────────────
+          const _BrowserCastPanel(),
         ],
       ),
       bottomNavigationBar: _buildNavRow(cs),
@@ -594,6 +635,15 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
               icon: const Icon(Icons.history, size: 20),
               tooltip: 'History',
               onPressed: _showHistorySheet,
+            ),
+            IconButton(
+              icon: Icon(
+                _desktopMode ? Icons.desktop_windows : Icons.phone_android,
+                size: 20,
+                color: _desktopMode ? cs.primary : null,
+              ),
+              tooltip: _desktopMode ? 'Switch to mobile' : 'Switch to desktop',
+              onPressed: _toggleDesktopMode,
             ),
             if (_detectedVideos.isNotEmpty)
               IconButton(
@@ -825,5 +875,562 @@ class _AnimatedCastButtonState extends State<_AnimatedCastButton>
         ),
       ),
     );
+  }
+}
+
+// ── Browser Cast Panel ──────────────────────────────────────────────────────
+//
+// An inline panel shown at the bottom of the browser when a video has been
+// extracted or is being cast. Provides device selection, cast button, and
+// full playback controls (seek, forward/rewind, volume) so the user never
+// has to leave the browser.
+
+class _BrowserCastPanel extends ConsumerStatefulWidget {
+  const _BrowserCastPanel();
+
+  @override
+  ConsumerState<_BrowserCastPanel> createState() => _BrowserCastPanelState();
+}
+
+class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
+  bool _expanded = true;
+  double? _volume;
+  bool _volumeFetched = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final videoState = ref.watch(videoProvider);
+    final castState = ref.watch(castProvider);
+    final devicesState = ref.watch(devicesProvider);
+
+    // Show nothing if no video is loaded/loading and we're not casting.
+    final showPanel = videoState is VideoLoaded ||
+        videoState is VideoLoading ||
+        castState is CastPlaying ||
+        castState is CastPreparing ||
+        castState is CastError;
+
+    if (!showPanel) return const SizedBox.shrink();
+
+    final cs = Theme.of(context).colorScheme;
+
+    // Auto-scan for devices when a new video appears.
+    if (videoState is VideoLoaded) {
+      final ds = ref.read(devicesProvider);
+      if (ds is DevicesIdle) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          ref.read(devicesProvider.notifier).scan();
+        });
+      }
+    }
+
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 200),
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerHigh,
+        border: Border(top: BorderSide(color: cs.outlineVariant)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // ── Casting controls (shown when actively casting) ──
+          if (castState is CastPlaying) _buildPlaybackControls(cs, castState),
+
+          if (castState is CastPreparing)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    width: 18, height: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: cs.primary),
+                  ),
+                  const SizedBox(width: 10),
+                  Text('Starting stream…',
+                      style: TextStyle(fontSize: 13, color: cs.onSurface)),
+                ],
+              ),
+            ),
+
+          if (castState is CastError)
+            Padding(
+              padding: const EdgeInsets.all(12),
+              child: Row(
+                children: [
+                  Icon(Icons.error_outline, size: 18, color: cs.error),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(castState.message,
+                        style: TextStyle(fontSize: 12, color: cs.error)),
+                  ),
+                  TextButton(
+                    onPressed: () => ref.read(castProvider.notifier).stop(),
+                    child: const Text('Dismiss', style: TextStyle(fontSize: 11)),
+                  ),
+                ],
+              ),
+            ),
+
+          // ── Pre-cast: device picker + cast button ──
+          if (castState is! CastPlaying &&
+              castState is! CastPreparing &&
+              videoState is VideoLoaded)
+            _buildPreCastRow(cs, videoState, devicesState),
+
+          // ── Loading state ──
+          if (videoState is VideoLoading && castState is CastIdle)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 12),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  SizedBox(
+                    width: 16, height: 16,
+                    child: CircularProgressIndicator(strokeWidth: 2, color: cs.primary),
+                  ),
+                  const SizedBox(width: 8),
+                  Text('Extracting video…',
+                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPreCastRow(
+      ColorScheme cs, VideoLoaded videoState, DevicesState devicesState) {
+    final selectedDevice = ref.watch(selectedDeviceProvider);
+    final selectedFormat = ref.watch(selectedFormatProvider);
+    final settings = ref.watch(settingsProvider);
+    final lastDeviceLocation = ref.watch(lastDeviceProvider);
+
+    // Gather available devices
+    final List<DlnaDevice> devices;
+    final bool isScanning;
+    if (devicesState is DevicesScanning) {
+      devices = devicesState.devicesFoundSoFar;
+      isScanning = true;
+    } else if (devicesState is DevicesResult) {
+      devices = devicesState.devices;
+      isScanning = false;
+    } else {
+      devices = [];
+      isScanning = false;
+    }
+
+    // Auto-select best format
+    if (selectedFormat == null && videoState.info.formats.isNotEmpty) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        ref.read(selectedFormatProvider.notifier).state =
+            videoState.info.formats.first;
+      });
+    }
+
+    // Auto-select last used device
+    if (selectedDevice == null && lastDeviceLocation != null && devices.isNotEmpty) {
+      final match = devices.where((d) => d.location == lastDeviceLocation).firstOrNull;
+      if (match != null) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          ref.read(selectedDeviceProvider.notifier).state = match;
+        });
+      }
+    }
+
+    // Auto-select single device
+    if (selectedDevice == null && !isScanning && devices.length == 1) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        ref.read(selectedDeviceProvider.notifier).state = devices.first;
+      });
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          // Title
+          Row(
+            children: [
+              Icon(Icons.play_circle_fill, size: 16, color: cs.primary),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  videoState.info.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12),
+                ),
+              ),
+              // Close panel / dismiss video
+              IconButton(
+                icon: const Icon(Icons.close, size: 16),
+                visualDensity: VisualDensity.compact,
+                onPressed: () => ref.read(videoProvider.notifier).reset(),
+                tooltip: 'Dismiss',
+              ),
+            ],
+          ),
+          const SizedBox(height: 4),
+
+          // Device picker row
+          Row(
+            children: [
+              Expanded(
+                child: InkWell(
+                  borderRadius: BorderRadius.circular(8),
+                  onTap: () => _showDevicePicker(cs, devices, isScanning),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    decoration: BoxDecoration(
+                      border: Border.all(color: cs.outlineVariant),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(Icons.tv, size: 16, color: cs.onSurfaceVariant),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            selectedDevice?.name ??
+                                (isScanning ? 'Scanning…' : 'Select TV'),
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: selectedDevice != null
+                                  ? cs.onSurface
+                                  : cs.onSurfaceVariant,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        if (isScanning)
+                          SizedBox(
+                            width: 12, height: 12,
+                            child: CircularProgressIndicator(
+                                strokeWidth: 1.5, color: cs.primary),
+                          )
+                        else
+                          Icon(Icons.arrow_drop_down,
+                              size: 18, color: cs.onSurfaceVariant),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 8),
+              // Cast button
+              FilledButton.icon(
+                icon: const Icon(Icons.cast, size: 18),
+                label: const Text('Cast'),
+                style: FilledButton.styleFrom(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                ),
+                onPressed: selectedDevice != null && selectedFormat != null
+                    ? () {
+                        ref.read(castHistoryProvider.notifier).add(
+                          videoState.sourceUrl,
+                          videoState.info.title,
+                          videoState.info.thumbnailUrl,
+                        );
+                        ref.read(lastDeviceProvider.notifier).save(selectedDevice.location);
+                        ref.read(castProvider.notifier).cast(
+                          device: selectedDevice,
+                          format: selectedFormat,
+                          title: videoState.info.title,
+                          routeThroughPhone: settings.routeThroughPhone,
+                          durationSeconds: videoState.info.durationSeconds,
+                        );
+                      }
+                    : null,
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  void _showDevicePicker(
+      ColorScheme cs, List<DlnaDevice> devices, bool isScanning) {
+    final selectedDevice = ref.read(selectedDeviceProvider);
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Center(
+                child: Container(
+                  width: 40, height: 4,
+                  margin: const EdgeInsets.only(bottom: 12),
+                  decoration: BoxDecoration(
+                    color: cs.onSurfaceVariant.withAlpha(80),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              Row(
+                children: [
+                  Icon(Icons.tv, color: cs.primary, size: 20),
+                  const SizedBox(width: 8),
+                  Text('Select TV',
+                      style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
+                          fontWeight: FontWeight.w600)),
+                  const Spacer(),
+                  if (isScanning)
+                    const SizedBox(
+                      width: 14, height: 14,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  else
+                    TextButton.icon(
+                      icon: const Icon(Icons.refresh, size: 14),
+                      label: const Text('Rescan', style: TextStyle(fontSize: 12)),
+                      onPressed: () {
+                        ref.read(devicesProvider.notifier).scan();
+                        Navigator.pop(ctx);
+                      },
+                    ),
+                ],
+              ),
+              const Divider(height: 12),
+              if (devices.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  child: Text(
+                    isScanning
+                        ? 'Looking for TVs on your network…'
+                        : 'No TVs found. Make sure your TV is on and on the same WiFi.',
+                    style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant),
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+              ...devices.map((d) {
+                final sel = selectedDevice == d;
+                return ListTile(
+                  dense: true,
+                  shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8)),
+                  tileColor: sel ? cs.primaryContainer.withAlpha(80) : null,
+                  leading: Icon(Icons.tv,
+                      color: sel ? cs.primary : cs.onSurfaceVariant, size: 20),
+                  title: Text(d.name,
+                      style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: sel ? FontWeight.w600 : FontWeight.normal)),
+                  subtitle: d.manufacturer.isNotEmpty
+                      ? Text(d.manufacturer, style: const TextStyle(fontSize: 11))
+                      : null,
+                  trailing: sel
+                      ? Icon(Icons.check_circle, color: cs.primary, size: 18)
+                      : null,
+                  onTap: () {
+                    ref.read(selectedDeviceProvider.notifier).state = d;
+                    Navigator.pop(ctx);
+                  },
+                );
+              }),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildPlaybackControls(ColorScheme cs, CastPlaying castState) {
+    final progress = ref.watch(castPositionProvider);
+    final total = progress.total.inSeconds;
+    final pos = progress.position.inSeconds.clamp(0, total > 0 ? total : 1);
+
+    // Fetch volume once
+    if (!_volumeFetched) {
+      _volumeFetched = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) async {
+        try {
+          if (castState.device.protocol == CastProtocol.chromecast) {
+            if (mounted) setState(() => _volume ??= 50);
+          } else {
+            final v = await ref.read(dlnaServiceProvider).getVolume(castState.device);
+            if (mounted && v != null) setState(() => _volume = v.toDouble());
+          }
+        } catch (_) {}
+      });
+    }
+
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 4),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          // ── Now playing header ──
+          Row(
+            children: [
+              Icon(Icons.cast_connected, color: cs.primary, size: 18),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(castState.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                            fontWeight: FontWeight.w600, fontSize: 12)),
+                    Text('on ${castState.device.name}',
+                        style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
+                  ],
+                ),
+              ),
+              // Collapse / expand toggle
+              IconButton(
+                icon: Icon(
+                  _expanded ? Icons.expand_more : Icons.expand_less,
+                  size: 20,
+                ),
+                visualDensity: VisualDensity.compact,
+                onPressed: () => setState(() => _expanded = !_expanded),
+              ),
+            ],
+          ),
+
+          // ── Seek bar ──
+          if (total > 0) ...[
+            SliderTheme(
+              data: SliderTheme.of(context).copyWith(
+                trackHeight: 3,
+                thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                overlayShape: const RoundSliderOverlayShape(overlayRadius: 14),
+              ),
+              child: Slider(
+                value: pos.toDouble(),
+                min: 0,
+                max: total.toDouble(),
+                onChanged: (_) {},
+                onChangeEnd: (v) =>
+                    ref.read(castProvider.notifier).seek(Duration(seconds: v.toInt())),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(_fmt(progress.position),
+                      style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
+                  Text(_fmt(progress.total),
+                      style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
+                ],
+              ),
+            ),
+          ],
+
+          // ── Transport controls ──
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+            children: [
+              // Rewind 10s
+              IconButton(
+                icon: const Icon(Icons.replay_10, size: 22),
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Rewind 10s',
+                onPressed: () {
+                  final newPos = Duration(
+                      seconds: (progress.position.inSeconds - 10).clamp(0, total));
+                  ref.read(castProvider.notifier).seek(newPos);
+                },
+              ),
+              // Play / Pause
+              IconButton.filled(
+                icon: Icon(
+                  castState.isPaused ? Icons.play_arrow : Icons.pause,
+                  size: 26,
+                ),
+                onPressed: () => ref.read(castProvider.notifier).pauseResume(),
+                tooltip: castState.isPaused ? 'Play' : 'Pause',
+              ),
+              // Forward 10s
+              IconButton(
+                icon: const Icon(Icons.forward_10, size: 22),
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Forward 10s',
+                onPressed: () {
+                  final newPos = Duration(
+                      seconds: (progress.position.inSeconds + 10).clamp(0, total));
+                  ref.read(castProvider.notifier).seek(newPos);
+                },
+              ),
+              // Stop
+              IconButton(
+                icon: const Icon(Icons.stop, size: 22),
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Stop',
+                onPressed: () {
+                  setState(() {
+                    _volume = null;
+                    _volumeFetched = false;
+                  });
+                  ref.read(castProvider.notifier).stop();
+                },
+              ),
+            ],
+          ),
+
+          // ── Volume (collapsible) ──
+          if (_expanded) ...[
+            const SizedBox(height: 2),
+            Row(
+              children: [
+                const Icon(Icons.volume_down, size: 16),
+                Expanded(
+                  child: SliderTheme(
+                    data: SliderTheme.of(context).copyWith(
+                      trackHeight: 2,
+                      thumbShape:
+                          const RoundSliderThumbShape(enabledThumbRadius: 5),
+                      overlayShape:
+                          const RoundSliderOverlayShape(overlayRadius: 12),
+                    ),
+                    child: Slider(
+                      value: (_volume ?? 50).clamp(0, 100).toDouble(),
+                      min: 0,
+                      max: 100,
+                      divisions: 20,
+                      label: '${(_volume ?? 50).round()}',
+                      onChanged: (v) => setState(() => _volume = v),
+                      onChangeEnd: (v) async {
+                        setState(() => _volume = v);
+                        if (castState.device.protocol == CastProtocol.chromecast) {
+                          await ref.read(chromecastServiceProvider).setVolume(v / 100);
+                        } else {
+                          await ref.read(dlnaServiceProvider).setVolume(
+                              castState.device, v.round());
+                        }
+                      },
+                    ),
+                  ),
+                ),
+                const Icon(Icons.volume_up, size: 16),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  String _fmt(Duration d) {
+    final h = d.inHours;
+    final m = (d.inMinutes % 60).toString().padLeft(2, '0');
+    final s = (d.inSeconds % 60).toString().padLeft(2, '0');
+    return h > 0 ? '$h:$m:$s' : '$m:$s';
   }
 }
