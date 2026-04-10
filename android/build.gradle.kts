@@ -19,8 +19,12 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
-// Force all plugins to compile Kotlin with JVM 17 (matches app target).
+// Force all plugins to compile with JVM 17 (matches app target).
 subprojects {
+    tasks.withType<JavaCompile>().configureEach {
+        sourceCompatibility = "17"
+        targetCompatibility = "17"
+    }
     tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
         compilerOptions {
             jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
