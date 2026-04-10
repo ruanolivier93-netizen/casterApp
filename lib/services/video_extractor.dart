@@ -36,7 +36,7 @@ class VideoExtractorService {
       return _extractHls(url);
     }
     // DASH manifest — parse for quality levels
-    if (url.toLowerCase().endsWith('.mpd')) {
+    if (RegExp(r'\.mpd(\?|#|$)', caseSensitive: false).hasMatch(url)) {
       return _extractDash(url);
     }
 
@@ -45,7 +45,14 @@ class VideoExtractorService {
 
   Future<VideoInfo> _extractYouTube(String url) async {
     final video = await _yt.videos.get(url);
-    final manifest = await _yt.videos.streamsClient.getManifest(video.id);
+
+    // Fetch streams and captions in parallel — both only need video.id.
+    final results = await Future.wait([
+      _yt.videos.streamsClient.getManifest(video.id),
+      _extractCaptions(video.id),
+    ]);
+    final manifest = results[0] as StreamManifest;
+    final subtitles = results[1] as List<SubtitleTrack>;
 
     final formats = <StreamFormat>[];
 
@@ -79,9 +86,6 @@ class VideoExtractorService {
         ));
       }
     }
-
-    // ── Subtitles / Closed Captions ─────────────────────────────────────────
-    final subtitles = await _extractCaptions(video.id);
 
     return VideoInfo(
       title: video.title,

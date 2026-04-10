@@ -723,8 +723,18 @@ video *,
     document.querySelectorAll('ytd-promoted-sparkles-web-renderer, ytd-promoted-video-renderer, ytd-display-ad-renderer, ytd-companion-slot-renderer, ytd-action-companion-ad-renderer, ytd-in-feed-ad-layout-renderer, ytd-ad-slot-renderer, ytd-banner-promo-renderer, ytd-merch-shelf-renderer, #player-ads, #masthead-ad').forEach(function(el) { el.remove(); });
   }
 
-  /* ══ Block ALL window.open popups ══ */
-  window.open = function() { return null; };
+  /* ══ Redirect window.open to new tab (block if ad) ══ */
+  window.open = function(url) {
+    if (url) {
+      try {
+        var resolved = new URL(url, location.href).href;
+        if (!isAdRedirect(resolved)) {
+          try { NewTab.postMessage(resolved); } catch(_) {}
+        }
+      } catch(_) {}
+    }
+    return null;
+  };
 
   /* ══ Ad-redirect URL detection (shared helper) ══ */
   var AD_REDIR_PATTERNS = [
@@ -879,11 +889,20 @@ video *,
         return;
       }
     } catch(_) {}
-    /* Block clicks on known ad-redirect links */
+    /* Handle links — open target=_blank in new tab, block ad links */
     var anchor = t.closest ? t.closest('a') : null;
-    if (anchor && anchor.href && isAdRedirect(anchor.href)) {
-      e.preventDefault();
-      e.stopImmediatePropagation();
+    if (anchor && anchor.href) {
+      if (anchor.target === '_blank' || anchor.target === '_new') {
+        e.preventDefault();
+        if (!isAdRedirect(anchor.href)) {
+          try { NewTab.postMessage(anchor.href); } catch(_) {}
+        }
+        return;
+      }
+      if (isAdRedirect(anchor.href)) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
     }
   }, true);
 

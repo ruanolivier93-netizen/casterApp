@@ -63,6 +63,30 @@ class _DetectedVideo {
   }
 }
 
+// ── Browser Tab Model ───────────────────────────────────────────────────────
+
+class _BrowserTab {
+  final String id;
+  final WebViewController controller;
+  String url;
+  String title = 'New Tab';
+  double progress = 0;
+  bool canGoBack = false;
+  bool canGoForward = false;
+  bool showBookmarks;
+  final List<_DetectedVideo> detectedVideos;
+
+  _BrowserTab({
+    required this.id,
+    required this.controller,
+    this.url = '',
+    this.showBookmarks = true,
+    List<_DetectedVideo>? detectedVideos,
+  }) : detectedVideos = detectedVideos ?? [];
+}
+
+const _kMaxTabs = 8;
+
 // ── Browser Screen ──────────────────────────────────────────────────────────
 
 class BrowserScreen extends ConsumerStatefulWidget {
@@ -76,22 +100,26 @@ class BrowserScreen extends ConsumerStatefulWidget {
 
 class _BrowserScreenState extends ConsumerState<BrowserScreen>
     with AutomaticKeepAliveClientMixin {
-  late final WebViewController _controller;
+  final _tabs = <_BrowserTab>[];
+  int _activeTabIndex = 0;
   final _urlController = TextEditingController();
   final _urlFocus = FocusNode();
-
-  String _currentUrl = '';
-  double _progress = 0;
-  bool _canGoBack = false;
-  bool _canGoForward = false;
   bool _desktopMode = false;
 
   static const _desktopUA =
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
-  final List<_DetectedVideo> _detectedVideos = [];
-  bool _showBookmarks = true;
+  // ── Convenience accessors (delegate to active tab) ──
+  _BrowserTab get _activeTab => _tabs[_activeTabIndex];
+  WebViewController get _controller => _activeTab.controller;
+  String get _currentUrl => _activeTab.url;
+  double get _progress => _activeTab.progress;
+  bool get _canGoBack => _activeTab.canGoBack;
+  bool get _canGoForward => _activeTab.canGoForward;
+  List<_DetectedVideo> get _detectedVideos => _activeTab.detectedVideos;
+  bool get _showBookmarks => _activeTab.showBookmarks;
+  set _showBookmarks(bool v) => _activeTab.showBookmarks = v;
 
   @override
   bool get wantKeepAlive => true;
@@ -99,8 +127,16 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   @override
   void initState() {
     super.initState();
+    final tab = _buildTab(url: 'https://www.google.com');
+    _tabs.add(tab);
+    _activeTabIndex = 0;
+    _urlController.text = 'https://www.google.com';
+    widget.onControllerCreated?.call(tab.controller);
+  }
 
-    // Platform-specific creation params for proper video playback support.
+  // ── Tab factory ───────────────────────────────────────────────────────────
+
+  _BrowserTab _buildTab({String? url}) {
     late final PlatformWebViewControllerCreationParams params;
     if (WebViewPlatform.instance is WebKitWebViewPlatform) {
       params = WebKitWebViewControllerCreationParams(
@@ -110,9 +146,19 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       params = const PlatformWebViewControllerCreationParams();
     }
 
-    _controller = WebViewController.fromPlatformCreationParams(params)
+    final tab = _BrowserTab(
+      id: 'tab_${DateTime.now().microsecondsSinceEpoch}',
+      controller: WebViewController.fromPlatformCreationParams(params),
+      url: url ?? '',
+      showBookmarks: url == null || url == 'https://www.google.com',
+    );
+
+    tab.controller
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..addJavaScriptChannel('VideoDetector', onMessageReceived: _onVideoDetected)
+      ..addJavaScriptChannel('VideoDetector',
+          onMessageReceived: (msg) => _onVideoDetectedForTab(tab, msg))
+      ..addJavaScriptChannel('NewTab',
+          onMessageReceived: (msg) => _onNewTabRequested(msg.message))
       ..setNavigationDelegate(NavigationDelegate(
         onNavigationRequest: (request) {
           if (AdBlocker.shouldBlock(request.url)) {
@@ -123,68 +169,140 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           }
           return NavigationDecision.navigate;
         },
-        onPageStarted: (url) {
-          if (mounted) {
-            setState(() {
-              _currentUrl = url;
-              _progress = 0;
-              _detectedVideos.clear();
-              _showBookmarks = false;
-            });
-            _urlController.text = url;
+        onPageStarted: (pageUrl) {
+          if (!mounted) return;
+          setState(() {
+            tab.url = pageUrl;
+            tab.progress = 0;
+            tab.detectedVideos.clear();
+            tab.showBookmarks = false;
+          });
+          if (_tabs.indexOf(tab) == _activeTabIndex) {
+            _urlController.text = pageUrl;
           }
-          // Inject CSS ad-blocker + network interceptor EARLY.
-          _controller.runJavaScript('''
+          tab.controller.runJavaScript('''
             (function(){
               var s = document.createElement('style');
               s.textContent = ${_escapeJsString(AdBlocker.cssRules)};
               (document.head || document.documentElement).appendChild(s);
             })();
           ''');
-          _controller.runJavaScript(AdBlocker.videoDetectorScript);
+          tab.controller.runJavaScript(AdBlocker.videoDetectorScript);
         },
         onProgress: (p) {
-          if (mounted) setState(() => _progress = p / 100);
+          if (mounted) setState(() => tab.progress = p / 100);
         },
-        onPageFinished: (url) async {
+        onPageFinished: (pageUrl) async {
           if (!mounted) return;
-          final back = await _controller.canGoBack();
-          final fwd = await _controller.canGoForward();
+          final back = await tab.controller.canGoBack();
+          final fwd = await tab.controller.canGoForward();
+          final title = await tab.controller.getTitle() ?? pageUrl;
           setState(() {
-            _currentUrl = url;
-            _progress = 1;
-            _canGoBack = back;
-            _canGoForward = fwd;
+            tab.url = pageUrl;
+            tab.progress = 1;
+            tab.canGoBack = back;
+            tab.canGoForward = fwd;
+            tab.title = title;
           });
-          _controller.runJavaScript(AdBlocker.jsScript);
-          _controller.runJavaScript(AdBlocker.videoDetectorScript);
-          // Record in browsing history
-          final title = await _controller.getTitle() ?? url;
-          ref.read(historyProvider.notifier).add(url, title);
+          if (_tabs.indexOf(tab) == _activeTabIndex) {
+            _urlController.text = pageUrl;
+          }
+          tab.controller.runJavaScript(AdBlocker.jsScript);
+          tab.controller.runJavaScript(AdBlocker.videoDetectorScript);
+          ref.read(historyProvider.notifier).add(pageUrl, title);
         },
-      ))
-      ..loadRequest(Uri.parse('https://www.google.com'));
+      ));
 
-    // Android-specific: enable video playback without user gesture.
-    if (_controller.platform is AndroidWebViewController) {
-      final android = _controller.platform as AndroidWebViewController;
+    if (tab.controller.platform is AndroidWebViewController) {
+      final android = tab.controller.platform as AndroidWebViewController;
       android.setMediaPlaybackRequiresUserGesture(false);
     }
 
-    widget.onControllerCreated?.call(_controller);
-    _urlController.text = 'https://www.google.com';
+    if (_desktopMode) {
+      tab.controller.setUserAgent(_desktopUA);
+    }
+
+    final loadUrl = url ?? 'https://www.google.com';
+    tab.controller.loadRequest(Uri.parse(loadUrl));
+    if (url == null) tab.title = 'Home';
+
+    return tab;
   }
 
-  void _onVideoDetected(JavaScriptMessage msg) {
+  // ── Tab management ────────────────────────────────────────────────────────
+
+  void _addNewTab({String? url, bool switchTo = true}) {
+    if (_tabs.length >= _kMaxTabs) {
+      // Close oldest non-active tab to make room
+      final oldest = _tabs.indexWhere((t) => _tabs.indexOf(t) != _activeTabIndex);
+      if (oldest >= 0) _closeTab(oldest);
+    }
+
+    final tab = _buildTab(url: url);
+    setState(() {
+      _tabs.add(tab);
+      if (switchTo) {
+        _activeTabIndex = _tabs.length - 1;
+        _urlController.text = tab.url;
+      }
+    });
+
+    if (switchTo) {
+      widget.onControllerCreated?.call(tab.controller);
+    }
+  }
+
+  void _closeTab(int index) {
+    if (_tabs.length <= 1) return; // Always keep at least one tab
+    setState(() {
+      _tabs.removeAt(index);
+      if (_activeTabIndex >= _tabs.length) {
+        _activeTabIndex = _tabs.length - 1;
+      } else if (_activeTabIndex > index) {
+        _activeTabIndex--;
+      }
+    });
+    _urlController.text = _activeTab.url;
+    widget.onControllerCreated?.call(_activeTab.controller);
+  }
+
+  void _switchToTab(int index) {
+    if (index < 0 || index >= _tabs.length || index == _activeTabIndex) return;
+    setState(() => _activeTabIndex = index);
+    _urlController.text = _activeTab.url;
+    widget.onControllerCreated?.call(_activeTab.controller);
+  }
+
+  void _onNewTabRequested(String url) {
+    if (url.isEmpty) return;
+    if (AdBlocker.shouldBlock(url) || AdBlocker.isPopupOrRedirect(url)) return;
+
+    _addNewTab(url: url, switchTo: false);
+
+    if (mounted) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: const Text('Opened in new tab'),
+          duration: const Duration(seconds: 2),
+          action: SnackBarAction(
+            label: 'Switch',
+            onPressed: () => _switchToTab(_tabs.length - 1),
+          ),
+        ),
+      );
+    }
+  }
+
+  void _onVideoDetectedForTab(_BrowserTab tab, JavaScriptMessage msg) {
     try {
       final data = jsonDecode(msg.message) as Map<String, dynamic>;
       final url = data['url'] as String? ?? '';
       final type = data['type'] as String? ?? '';
       if (url.isEmpty) return;
-      if (_detectedVideos.any((v) => v.url == url)) return;
+      if (tab.detectedVideos.any((v) => v.url == url)) return;
       if (mounted) {
         setState(() {
-          _detectedVideos.add(_DetectedVideo(url: url, type: type));
+          tab.detectedVideos.add(_DetectedVideo(url: url, type: type));
         });
       }
     } catch (_) {}
@@ -211,10 +329,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
 
   void _toggleDesktopMode() {
     setState(() => _desktopMode = !_desktopMode);
-    if (_desktopMode) {
-      _controller.setUserAgent(_desktopUA);
-    } else {
-      _controller.setUserAgent(null); // revert to platform default
+    for (final tab in _tabs) {
+      tab.controller.setUserAgent(_desktopMode ? _desktopUA : null);
     }
     _controller.reload();
   }
@@ -484,13 +600,131 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       ),
       body: Column(
         children: [
+          // ── Tab strip (visible when 2+ tabs) ──
+          if (_tabs.length > 1) _buildTabStrip(cs),
           if (_showBookmarks) _buildBookmarksGrid(cs),
-          Expanded(child: WebViewWidget(controller: _controller)),
+          Expanded(
+            child: IndexedStack(
+              index: _activeTabIndex,
+              children: _tabs
+                  .map((tab) => KeyedSubtree(
+                        key: ValueKey(tab.id),
+                        child: WebViewWidget(controller: tab.controller),
+                      ))
+                  .toList(),
+            ),
+          ),
           // ── Inline Cast Panel ─────────────────────────────────────────────
           const _BrowserCastPanel(),
         ],
       ),
       bottomNavigationBar: _buildNavRow(cs),
+    );
+  }
+
+  // ── Tab strip ──────────────────────────────────────────────────────────────
+
+  Widget _buildTabStrip(ColorScheme cs) {
+    return Container(
+      height: 38,
+      decoration: BoxDecoration(
+        color: cs.surfaceContainerLow,
+        border: Border(bottom: BorderSide(color: cs.outlineVariant, width: 0.5)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            child: ListView.builder(
+              scrollDirection: Axis.horizontal,
+              itemCount: _tabs.length,
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 4),
+              itemBuilder: (_, i) {
+                final tab = _tabs[i];
+                final isActive = i == _activeTabIndex;
+                return GestureDetector(
+                  onTap: () => _switchToTab(i),
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 150),
+                    constraints: const BoxConstraints(maxWidth: 160, minWidth: 60),
+                    margin: const EdgeInsets.only(right: 4),
+                    padding: const EdgeInsets.symmetric(horizontal: 10),
+                    decoration: BoxDecoration(
+                      color: isActive
+                          ? cs.primaryContainer
+                          : cs.surfaceContainerHighest,
+                      borderRadius: BorderRadius.circular(8),
+                      border: isActive
+                          ? Border.all(color: cs.primary.withAlpha(80), width: 1)
+                          : null,
+                    ),
+                    child: Row(
+                      children: [
+                        Icon(
+                          tab.progress < 1 && tab.progress > 0
+                              ? Icons.hourglass_top
+                              : Icons.public,
+                          size: 12,
+                          color: isActive
+                              ? cs.onPrimaryContainer
+                              : cs.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 6),
+                        Expanded(
+                          child: Text(
+                            tab.title.isNotEmpty ? tab.title : 'New Tab',
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight:
+                                  isActive ? FontWeight.w600 : FontWeight.normal,
+                              color: isActive
+                                  ? cs.onPrimaryContainer
+                                  : cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 4),
+                        InkWell(
+                          borderRadius: BorderRadius.circular(10),
+                          onTap: () => _closeTab(i),
+                          child: Padding(
+                            padding: const EdgeInsets.all(2),
+                            child: Icon(
+                              Icons.close,
+                              size: 13,
+                              color: isActive
+                                  ? cs.onPrimaryContainer
+                                  : cs.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            ),
+          ),
+          if (_tabs.length < _kMaxTabs)
+            Padding(
+              padding: const EdgeInsets.only(right: 6),
+              child: InkWell(
+                borderRadius: BorderRadius.circular(8),
+                onTap: () => _addNewTab(),
+                child: Container(
+                  width: 30,
+                  height: 30,
+                  decoration: BoxDecoration(
+                    color: cs.surfaceContainerHighest,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(Icons.add, size: 16, color: cs.onSurfaceVariant),
+                ),
+              ),
+            ),
+        ],
+      ),
     );
   }
 
@@ -590,7 +824,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
 
     return SafeArea(
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
         child: Row(
           mainAxisAlignment: MainAxisAlignment.spaceAround,
           children: [
@@ -611,6 +845,13 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                 setState(() => _showBookmarks = true);
                 _controller.loadRequest(Uri.parse('https://www.google.com'));
               },
+            ),
+            // ── Tab counter ──
+            _TabCountButton(
+              count: _tabs.length,
+              onTap: _tabs.length > 1
+                  ? _showTabOverview
+                  : () => _addNewTab(),
             ),
             IconButton(
               icon: Icon(
@@ -654,6 +895,118 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           ],
         ),
       ),
+    );
+  }
+
+  void _showTabOverview() {
+    final cs = Theme.of(context).colorScheme;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            return Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Center(
+                    child: Container(
+                      width: 40,
+                      height: 4,
+                      margin: const EdgeInsets.only(bottom: 12),
+                      decoration: BoxDecoration(
+                        color: cs.onSurfaceVariant.withAlpha(80),
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  Row(
+                    children: [
+                      Icon(Icons.tab, color: cs.primary, size: 20),
+                      const SizedBox(width: 8),
+                      Text(
+                        '${_tabs.length} Tab${_tabs.length == 1 ? '' : 's'}',
+                        style: Theme.of(ctx)
+                            .textTheme
+                            .titleMedium
+                            ?.copyWith(fontWeight: FontWeight.w600),
+                      ),
+                      const Spacer(),
+                      if (_tabs.length < _kMaxTabs)
+                        TextButton.icon(
+                          icon: const Icon(Icons.add, size: 16),
+                          label: const Text('New Tab',
+                              style: TextStyle(fontSize: 12)),
+                          onPressed: () {
+                            Navigator.pop(ctx);
+                            _addNewTab();
+                          },
+                        ),
+                    ],
+                  ),
+                  const Divider(height: 12),
+                  ...List.generate(_tabs.length, (i) {
+                    final tab = _tabs[i];
+                    final isActive = i == _activeTabIndex;
+                    return ListTile(
+                      dense: true,
+                      shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10)),
+                      tileColor:
+                          isActive ? cs.primaryContainer.withAlpha(80) : null,
+                      leading: Icon(
+                        Icons.public,
+                        color: isActive ? cs.primary : cs.onSurfaceVariant,
+                        size: 20,
+                      ),
+                      title: Text(
+                        tab.title.isNotEmpty ? tab.title : 'New Tab',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight:
+                              isActive ? FontWeight.w600 : FontWeight.normal,
+                        ),
+                      ),
+                      subtitle: Text(
+                        tab.url.isNotEmpty ? tab.url : 'about:blank',
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                            fontSize: 10, color: cs.onSurfaceVariant),
+                      ),
+                      trailing: _tabs.length > 1
+                          ? IconButton(
+                              icon: const Icon(Icons.close, size: 16),
+                              visualDensity: VisualDensity.compact,
+                              onPressed: () {
+                                _closeTab(i);
+                                if (_tabs.length <= 1) {
+                                  Navigator.pop(ctx);
+                                } else {
+                                  setSheetState(() {});
+                                }
+                              },
+                            )
+                          : null,
+                      onTap: () {
+                        Navigator.pop(ctx);
+                        _switchToTab(i);
+                      },
+                    );
+                  }),
+                ],
+              ),
+            );
+          },
+        );
+      },
     );
   }
 
@@ -820,6 +1173,40 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     } catch (_) {
       return 'video_${DateTime.now().millisecondsSinceEpoch}.mp4';
     }
+  }
+}
+
+// ── Tab Count Button ────────────────────────────────────────────────────────
+
+class _TabCountButton extends StatelessWidget {
+  final int count;
+  final VoidCallback onTap;
+  const _TabCountButton({required this.count, required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return InkWell(
+      borderRadius: BorderRadius.circular(6),
+      onTap: onTap,
+      child: Container(
+        width: 28,
+        height: 28,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(color: cs.onSurface, width: 1.8),
+        ),
+        alignment: Alignment.center,
+        child: Text(
+          '$count',
+          style: TextStyle(
+            fontSize: 12,
+            fontWeight: FontWeight.w700,
+            color: cs.onSurface,
+          ),
+        ),
+      ),
+    );
   }
 }
 
