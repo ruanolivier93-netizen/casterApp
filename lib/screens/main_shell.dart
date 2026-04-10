@@ -3,7 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:webview_flutter/webview_flutter.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import '../providers/app_state.dart';
 import '../widgets/mini_player.dart';
 import 'home_screen.dart';
@@ -21,7 +21,7 @@ class MainShell extends ConsumerStatefulWidget {
 class _MainShellState extends ConsumerState<MainShell> {
   int _tabIndex = 0;
   bool _browserInitialised = false;
-  WebViewController? _webController;
+  InAppWebViewController? _webController;
   StreamSubscription? _shareSub;
 
   static const _shareChannel = MethodChannel('com.videocaster/share');

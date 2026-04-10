@@ -122,6 +122,9 @@ class AdBlocker {
     'sbembed.com', 'embedsito.com', 'vidcloud.co',
   ];
 
+  /// Expose blocked domains for use with InAppWebView ContentBlocker rules.
+  static List<String> get blockedDomains => _blockedDomains;
+
   // ── Blocked domains (~250 entries) ────────────────────────────────────────
   static const _blockedDomains = <String>[
     // ── Google Ads / DFP / AdSense / Analytics ──
@@ -1333,7 +1336,7 @@ video *,
     if (lower.indexOf('/pixel') !== -1 || lower.indexOf('/beacon') !== -1) return;
     if (lower.indexOf('/tracker') !== -1 || lower.indexOf('/tracking') !== -1) return;
     sent[url] = true;
-    try { VideoDetector.postMessage(JSON.stringify({url: url, type: type})); } catch(_) {}
+    try { window.flutter_inappwebview.callHandler('VideoDetector', JSON.stringify({url: url, type: type})); } catch(_) {}
   }
 
   /* ── Layer 1: Intercept XMLHttpRequest ── */

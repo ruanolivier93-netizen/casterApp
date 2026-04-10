@@ -1,10 +1,9 @@
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:webview_flutter/webview_flutter.dart';
-import 'package:webview_flutter_android/webview_flutter_android.dart';
-import 'package:webview_flutter_wkwebview/webview_flutter_wkwebview.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import '../services/ad_blocker.dart';
 import '../providers/bookmarks_history.dart';
@@ -135,7 +134,7 @@ class _DetectedVideo {
 
 class _BrowserTab {
   final String id;
-  final WebViewController controller;
+  InAppWebViewController? controller; // set by onWebViewCreated
   String url;
   String title = 'New Tab';
   double progress = 0;
@@ -143,13 +142,12 @@ class _BrowserTab {
   bool canGoForward = false;
   bool showBookmarks;
   final List<_DetectedVideo> detectedVideos;
-  String? thumbnailUrl; // og:image from the page
-  String? lastBlockedDomain; // last ad domain blocked (for notification bar)
+  String? thumbnailUrl;
+  String? lastBlockedDomain;
   DateTime? lastBlockedTime;
 
   _BrowserTab({
     required this.id,
-    required this.controller,
     this.url = '',
     this.showBookmarks = true,
     List<_DetectedVideo>? detectedVideos,
@@ -162,7 +160,7 @@ const _kMaxTabs = 8;
 
 class BrowserScreen extends ConsumerStatefulWidget {
   final OnCastUrl onCastUrl;
-  final ValueChanged<WebViewController>? onControllerCreated;
+  final ValueChanged<InAppWebViewController>? onControllerCreated;
   const BrowserScreen({super.key, required this.onCastUrl, this.onControllerCreated});
 
   @override
@@ -181,9 +179,12 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
+  /// Content blocker rules built from AdBlocker.blockedDomains.
+  late final List<ContentBlocker> _contentBlockers = _buildContentBlockers();
+
   // ── Convenience accessors (delegate to active tab) ──
   _BrowserTab get _activeTab => _tabs[_activeTabIndex];
-  WebViewController get _controller => _activeTab.controller;
+  InAppWebViewController? get _controller => _activeTab.controller;
   String get _currentUrl => _activeTab.url;
   double get _progress => _activeTab.progress;
   bool get _canGoBack => _activeTab.canGoBack;
@@ -198,103 +199,132 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   @override
   void initState() {
     super.initState();
-    final tab = _buildTab(url: 'https://www.google.com');
+    final tab = _createTab(url: 'https://www.google.com');
     _tabs.add(tab);
     _activeTabIndex = 0;
     _urlController.text = 'https://www.google.com';
-    widget.onControllerCreated?.call(tab.controller);
+  }
+
+  // ── Content blocker builder ───────────────────────────────────────────────
+
+  List<ContentBlocker> _buildContentBlockers() {
+    final blockers = <ContentBlocker>[];
+    for (final domain in AdBlocker.blockedDomains) {
+      blockers.add(ContentBlocker(
+        trigger: ContentBlockerTrigger(urlFilter: '.*${RegExp.escape(domain)}.*'),
+        action: ContentBlockerAction(type: ContentBlockerActionType.BLOCK),
+      ));
+    }
+    return blockers;
   }
 
   // ── Tab factory ───────────────────────────────────────────────────────────
 
-  _BrowserTab _buildTab({String? url}) {
-    late final PlatformWebViewControllerCreationParams params;
-    if (WebViewPlatform.instance is WebKitWebViewPlatform) {
-      params = WebKitWebViewControllerCreationParams(
-        allowsInlineMediaPlayback: true,
-      );
-    } else {
-      params = const PlatformWebViewControllerCreationParams();
-    }
-
-    final tab = _BrowserTab(
+  _BrowserTab _createTab({String? url}) {
+    return _BrowserTab(
       id: 'tab_${DateTime.now().microsecondsSinceEpoch}',
-      controller: WebViewController.fromPlatformCreationParams(params),
       url: url ?? '',
       showBookmarks: url == null || url == 'https://www.google.com',
     );
+  }
 
-    tab.controller
-      ..setJavaScriptMode(JavaScriptMode.unrestricted)
-      ..addJavaScriptChannel('VideoDetector',
-          onMessageReceived: (msg) => _onVideoDetectedForTab(tab, msg))
-      ..addJavaScriptChannel('NewTab',
-          onMessageReceived: (msg) => _onNewTabRequested(msg.message))
-      ..setNavigationDelegate(NavigationDelegate(
-        onNavigationRequest: (request) {
-          return NavigationDecision.navigate;
-        },
-        onPageStarted: (pageUrl) {
-          if (!mounted) return;
-          setState(() {
-            tab.url = pageUrl;
-            tab.progress = 0;
-            tab.detectedVideos.clear();
-            tab.showBookmarks = false;
-          });
-          if (_tabs.indexOf(tab) == _activeTabIndex) {
-            _urlController.text = pageUrl;
-          }
-          tab.controller.runJavaScript(AdBlocker.videoDetectorScript);
-        },
-        onProgress: (p) {
-          if (mounted) setState(() => tab.progress = p / 100);
-        },
-        onPageFinished: (pageUrl) async {
-          if (!mounted) return;
-          final back = await tab.controller.canGoBack();
-          final fwd = await tab.controller.canGoForward();
-          final title = await tab.controller.getTitle() ?? pageUrl;
-          setState(() {
-            tab.url = pageUrl;
-            tab.progress = 1;
-            tab.canGoBack = back;
-            tab.canGoForward = fwd;
-            tab.title = title;
-          });
-          if (_tabs.indexOf(tab) == _activeTabIndex) {
-            _urlController.text = pageUrl;
-          }
-          tab.controller.runJavaScript(AdBlocker.videoDetectorScript);
-          // Extract page thumbnail (og:image) for video list
-          tab.controller.runJavaScript('''
-            (function() {
-              var meta = document.querySelector('meta[property="og:image"]');
-              if (!meta) meta = document.querySelector('meta[name="twitter:image"]');
-              if (!meta) meta = document.querySelector('meta[property="og:image:url"]');
-              if (meta && meta.content) {
-                VideoDetector.postMessage(JSON.stringify({url: meta.content, type: 'thumbnail'}));
-              }
-            })();
-          ''');
-          ref.read(historyProvider.notifier).add(pageUrl, title);
-        },
-      ));
+  /// Builds an InAppWebView widget for a given tab.
+  Widget _buildWebView(_BrowserTab tab) {
+    final initialUrl = tab.url.isNotEmpty ? tab.url : 'https://www.google.com';
 
-    if (tab.controller.platform is AndroidWebViewController) {
-      final android = tab.controller.platform as AndroidWebViewController;
-      android.setMediaPlaybackRequiresUserGesture(false);
-    }
-
-    if (_desktopMode) {
-      tab.controller.setUserAgent(_desktopUA);
-    }
-
-    final loadUrl = url ?? 'https://www.google.com';
-    tab.controller.loadRequest(Uri.parse(loadUrl));
-    if (url == null) tab.title = 'Home';
-
-    return tab;
+    return InAppWebView(
+      initialUrlRequest: URLRequest(url: WebUri(initialUrl)),
+      initialUserScripts: UnmodifiableListView([
+        UserScript(
+          source: AdBlocker.videoDetectorScript,
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+      ]),
+      initialSettings: InAppWebViewSettings(
+        javaScriptEnabled: true,
+        mediaPlaybackRequiresUserGesture: false,
+        allowsInlineMediaPlayback: true,
+        supportMultipleWindows: true,
+        javaScriptCanOpenWindowsAutomatically: true,
+        userAgent: _desktopMode ? _desktopUA : null,
+        contentBlockers: _contentBlockers,
+      ),
+      onWebViewCreated: (controller) {
+        tab.controller = controller;
+        controller.addJavaScriptHandler(
+          handlerName: 'VideoDetector',
+          callback: (args) {
+            if (args.isNotEmpty && args.first is String) {
+              _onVideoDetectedForTab(tab, args.first as String);
+            }
+          },
+        );
+        if (_tabs.indexOf(tab) == _activeTabIndex) {
+          widget.onControllerCreated?.call(controller);
+        }
+      },
+      shouldOverrideUrlLoading: (controller, action) async {
+        return NavigationActionPolicy.ALLOW;
+      },
+      onCreateWindow: (controller, createWindowAction) async {
+        final url = createWindowAction.request.url?.toString() ?? '';
+        if (url.isNotEmpty) {
+          _onNewTabRequested(url);
+        }
+        return false; // we handle it ourselves
+      },
+      onLoadStart: (controller, url) {
+        if (!mounted) return;
+        final pageUrl = url?.toString() ?? '';
+        setState(() {
+          tab.url = pageUrl;
+          tab.progress = 0;
+          tab.detectedVideos.clear();
+          tab.showBookmarks = false;
+        });
+        if (_tabs.indexOf(tab) == _activeTabIndex) {
+          _urlController.text = pageUrl;
+        }
+      },
+      onProgressChanged: (controller, p) {
+        if (mounted) setState(() => tab.progress = p / 100);
+      },
+      onLoadStop: (controller, url) async {
+        if (!mounted) return;
+        final pageUrl = url?.toString() ?? '';
+        final back = await controller.canGoBack();
+        final fwd = await controller.canGoForward();
+        final title = await controller.getTitle() ?? pageUrl;
+        setState(() {
+          tab.url = pageUrl;
+          tab.progress = 1;
+          tab.canGoBack = back;
+          tab.canGoForward = fwd;
+          tab.title = title;
+        });
+        if (_tabs.indexOf(tab) == _activeTabIndex) {
+          _urlController.text = pageUrl;
+        }
+        // Re-inject video detector (some SPAs clear scripts)
+        await controller.evaluateJavascript(source: AdBlocker.videoDetectorScript);
+        // Extract page thumbnail (og:image) for video list
+        await controller.evaluateJavascript(source: '''
+          (function() {
+            var meta = document.querySelector('meta[property="og:image"]');
+            if (!meta) meta = document.querySelector('meta[name="twitter:image"]');
+            if (!meta) meta = document.querySelector('meta[property="og:image:url"]');
+            if (meta && meta.content) {
+              window.flutter_inappwebview.callHandler('VideoDetector',
+                JSON.stringify({url: meta.content, type: 'thumbnail'}));
+            }
+          })();
+        ''');
+        ref.read(historyProvider.notifier).add(pageUrl, title);
+      },
+      onConsoleMessage: (controller, consoleMessage) {
+        // Silently ignore console messages
+      },
+    );
   }
 
   // ── Tab management ────────────────────────────────────────────────────────
@@ -306,7 +336,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       if (oldest >= 0) _closeTab(oldest);
     }
 
-    final tab = _buildTab(url: url);
+    final tab = _createTab(url: url);
     setState(() {
       _tabs.add(tab);
       if (switchTo) {
@@ -314,10 +344,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         _urlController.text = tab.url;
       }
     });
-
-    if (switchTo) {
-      widget.onControllerCreated?.call(tab.controller);
-    }
   }
 
   void _closeTab(int index) {
@@ -331,14 +357,16 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       }
     });
     _urlController.text = _activeTab.url;
-    widget.onControllerCreated?.call(_activeTab.controller);
+    final c = _activeTab.controller;
+    if (c != null) widget.onControllerCreated?.call(c);
   }
 
   void _switchToTab(int index) {
     if (index < 0 || index >= _tabs.length || index == _activeTabIndex) return;
     setState(() => _activeTabIndex = index);
     _urlController.text = _activeTab.url;
-    widget.onControllerCreated?.call(_activeTab.controller);
+    final c = _activeTab.controller;
+    if (c != null) widget.onControllerCreated?.call(c);
   }
 
   void _onNewTabRequested(String url) {
@@ -359,9 +387,9 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     }
   }
 
-  void _onVideoDetectedForTab(_BrowserTab tab, JavaScriptMessage msg) {
+  void _onVideoDetectedForTab(_BrowserTab tab, String message) {
     try {
-      final data = jsonDecode(msg.message) as Map<String, dynamic>;
+      final data = jsonDecode(message) as Map<String, dynamic>;
       final url = data['url'] as String? ?? '';
       final type = data['type'] as String? ?? '';
       if (url.isEmpty) return;
@@ -417,16 +445,17 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     } else if (!url.startsWith('http://') && !url.startsWith('https://')) {
       url = 'https://$url';
     }
-    _controller.loadRequest(Uri.parse(url));
+    _controller?.loadUrl(urlRequest: URLRequest(url: WebUri(url)));
     _urlFocus.unfocus();
   }
 
   void _toggleDesktopMode() {
     setState(() => _desktopMode = !_desktopMode);
+    final ua = _desktopMode ? _desktopUA : '';
     for (final tab in _tabs) {
-      tab.controller.setUserAgent(_desktopMode ? _desktopUA : null);
+      tab.controller?.setSettings(settings: InAppWebViewSettings(userAgent: ua));
     }
-    _controller.reload();
+    _controller?.reload();
   }
 
   // ignore: unused_element — temporarily disabled ad blocker
@@ -631,7 +660,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           IconButton(
             icon: const Icon(Icons.refresh, size: 20),
             tooltip: 'Reload',
-            onPressed: () => _controller.reload(),
+            onPressed: () => _controller?.reload(),
           ),
         ],
         bottom: _progress < 1
@@ -652,7 +681,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
               children: _tabs
                   .map((tab) => KeyedSubtree(
                         key: ValueKey(tab.id),
-                        child: WebViewWidget(controller: tab.controller),
+                        child: _buildWebView(tab),
                       ))
                   .toList(),
             ),
@@ -809,7 +838,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                         : host,
                     style: const TextStyle(fontSize: 11),
                   ),
-                  onPressed: () => _controller.loadRequest(Uri.parse(b.url)),
+                  onPressed: () => _controller?.loadUrl(urlRequest: URLRequest(url: WebUri(b.url))),
                 );
               }).toList(),
             ),
@@ -823,7 +852,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                 .map((b) => ActionChip(
                       avatar: Icon(b.icon, size: 16),
                       label: Text(b.label, style: const TextStyle(fontSize: 12)),
-                      onPressed: () => _controller.loadRequest(Uri.parse(b.url)),
+                      onPressed: () => _controller?.loadUrl(urlRequest: URLRequest(url: WebUri(b.url))),
                     ))
                 .toList(),
           ),
@@ -875,19 +904,19 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
             IconButton(
               icon: const Icon(Icons.arrow_back_ios, size: 18),
               tooltip: 'Back',
-              onPressed: _canGoBack ? () => _controller.goBack() : null,
+              onPressed: _canGoBack ? () => _controller?.goBack() : null,
             ),
             IconButton(
               icon: const Icon(Icons.arrow_forward_ios, size: 18),
               tooltip: 'Forward',
-              onPressed: _canGoForward ? () => _controller.goForward() : null,
+              onPressed: _canGoForward ? () => _controller?.goForward() : null,
             ),
             IconButton(
               icon: const Icon(Icons.home_outlined, size: 20),
               tooltip: 'Home',
               onPressed: () {
                 setState(() => _showBookmarks = true);
-                _controller.loadRequest(Uri.parse('https://www.google.com'));
+                _controller?.loadUrl(urlRequest: URLRequest(url: WebUri('https://www.google.com')));
               },
             ),
             // ── Tab counter ──
@@ -1117,7 +1146,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                                       fontSize: 11, color: cs.onSurfaceVariant)),
                               onTap: () {
                                 Navigator.pop(ctx);
-                                _controller.loadRequest(Uri.parse(entry.url));
+                                _controller?.loadUrl(urlRequest: URLRequest(url: WebUri(entry.url)));
                               },
                               trailing: IconButton(
                                 icon: const Icon(Icons.close, size: 16),
