@@ -217,6 +217,12 @@ class StreamProxyService {
   /// If the response is an HLS manifest (.m3u8), segment/variant URLs are
   /// rewritten to go through this proxy so the TV never contacts the CDN
   /// directly (which would fail without proper headers/cookies).
+  ///
+  /// Implements **auto-resume**: many CDNs (YouTube, lookmovie, etc.) throttle
+  /// connections by sending an initial burst of data (~7-10 seconds) and then
+  /// closing the connection, expecting the client to reconnect with a Range
+  /// header for the next chunk.  We detect this and keep reconnecting until
+  /// all data is delivered to the TV.
   Future<void> _proxyRemoteStream(HttpRequest req, String streamUrl) async {
     try {
       final parsedUrl = Uri.parse(streamUrl);
@@ -229,42 +235,34 @@ class StreamProxyService {
           : 'Mozilla/5.0 (Linux; Android 14; Pixel 8) '
               'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36';
 
-      final headers = <String, String>{
+      final baseHeaders = <String, String>{
         'User-Agent': ua,
         'Accept': '*/*',
         'Accept-Language': 'en-US,en;q=0.9',
         'Connection': 'keep-alive',
-        // Use the original stream's host as Origin/Referer for ALL proxied
-        // requests.  CDNs validate Referer against the page that initiated
-        // playback, not against whichever sub-domain serves each segment.
         'Origin': _originHost ?? '${parsedUrl.scheme}://${parsedUrl.host}',
         'Referer': _originHost != null ? '$_originHost/' : '${parsedUrl.scheme}://${parsedUrl.host}/',
         ..._extraHeaders,
       };
 
       // Forward Range header so the TV can seek within the stream.
-      final range = req.headers.value('range');
-      if (range != null) headers['Range'] = range;
+      final tvRange = req.headers.value('range');
+      if (tvRange != null) baseHeaders['Range'] = tvRange;
 
-      // Use HEAD for the upstream request too when the TV sends HEAD.
-      // This avoids downloading the full body just to discard it.
+      // ── Initial upstream fetch (with retry) ────────────────────────────
       final method = isHead ? 'HEAD' : 'GET';
-
-      // Try up to 2 times — the first attempt can fail if the CDN resets
-      // the connection or if there's a transient DNS/network hiccup.
       http.StreamedResponse? upstreamResp;
       Object? lastError;
       for (var attempt = 0; attempt < 2; attempt++) {
         try {
           final upstreamReq = http.Request(method, Uri.parse(streamUrl))
-            ..headers.addAll(headers);
+            ..headers.addAll(baseHeaders);
           upstreamResp = await _client!.send(upstreamReq)
               .timeout(const Duration(seconds: 60));
-          break; // success
+          break;
         } catch (e) {
           lastError = e;
           if (attempt == 0) {
-            // Brief pause before retry
             await Future.delayed(const Duration(milliseconds: 500));
           }
         }
@@ -278,7 +276,7 @@ class StreamProxyService {
         return;
       }
 
-      // ── Normal (MP4, TS segment, etc.) — pipe bytes straight through ──
+      // ── Set response headers from the initial upstream response ────────
       req.response.statusCode = upstreamResp.statusCode;
 
       for (final entry in upstreamResp.headers.entries) {
@@ -288,31 +286,73 @@ class StreamProxyService {
           case 'content-range':
           case 'accept-ranges':
           case 'cache-control':
-            // Note: we intentionally skip 'transfer-encoding' — let Dart's
-            // HttpResponse manage chunked encoding automatically to avoid
-            // conflicting headers that confuse some TVs.
             req.response.headers.set(entry.key, entry.value);
         }
       }
-      // Always advertise range support so the TV knows it can seek.
       if (!upstreamResp.headers.containsKey('accept-ranges')) {
         req.response.headers.set('accept-ranges', 'bytes');
       }
-      // Guarantee a Content-Type — some TVs refuse playback without one.
       if (!upstreamResp.headers.containsKey('content-type')) {
         req.response.headers.set('content-type', _guessMime(streamUrl));
       }
-      // CORS — allows any embedded player to read the stream.
       req.response.headers.set('Access-Control-Allow-Origin', '*');
 
       if (isHead) {
-        // HEAD — don't pipe any body, just close with headers.
         await upstreamResp.stream.drain<void>();
         await req.response.close();
         return;
       }
 
-      await req.response.addStream(upstreamResp.stream);
+      // ── Pipe data with auto-resume ─────────────────────────────────────
+      // Determine expected total size so we know when to stop.
+      final expectedLength = _parseExpectedLength(upstreamResp);
+      int bytesSent = 0;
+
+      // Pipe the initial response body
+      await for (final chunk in upstreamResp.stream) {
+        req.response.add(chunk);
+        bytesSent += chunk.length;
+      }
+
+      // Auto-resume: if the CDN closed the connection before all bytes
+      // were delivered (common with YouTube/CDN throttling), reconnect
+      // with a Range header and keep piping.
+      if (expectedLength != null && bytesSent < expectedLength) {
+        // Calculate the absolute start offset (in case TV sent Range initially)
+        int absoluteOffset = bytesSent;
+        if (tvRange != null) {
+          final match = RegExp(r'bytes=(\d+)-').firstMatch(tvRange);
+          if (match != null) {
+            absoluteOffset = int.parse(match.group(1)!) + bytesSent;
+          }
+        }
+
+        const maxResumes = 500; // safety limit (~500 reconnections)
+        for (var i = 0; i < maxResumes && bytesSent < expectedLength; i++) {
+          try {
+            final resumeHeaders = Map<String, String>.from(baseHeaders);
+            resumeHeaders['Range'] = 'bytes=$absoluteOffset-';
+
+            final resumeReq = http.Request('GET', Uri.parse(streamUrl))
+              ..headers.addAll(resumeHeaders);
+            final resumeResp = await _client!.send(resumeReq)
+                .timeout(const Duration(seconds: 60));
+
+            int chunkBytes = 0;
+            await for (final chunk in resumeResp.stream) {
+              req.response.add(chunk);
+              chunkBytes += chunk.length;
+            }
+
+            if (chunkBytes == 0) break; // server returned empty — we're done
+            bytesSent += chunkBytes;
+            absoluteOffset += chunkBytes;
+          } catch (_) {
+            break; // can't resume further — deliver what we have
+          }
+        }
+      }
+
       await req.response.close();
     } on TimeoutException catch (_) {
       try {
@@ -405,6 +445,28 @@ class StreamProxyService {
     _originalMimeType = null;
     _client?.close();
     _client = null;
+  }
+
+  /// Extracts the total expected body length from an upstream response.
+  /// Returns `null` when unknown (e.g. chunked transfer without Content-Length).
+  static int? _parseExpectedLength(http.StreamedResponse resp) {
+    // For 206 Partial-Content, the full size is in "Content-Range: bytes 0-X/TOTAL"
+    final cr = resp.headers['content-range'];
+    if (cr != null) {
+      final m = RegExp(r'/(\d+)').firstMatch(cr);
+      if (m != null) {
+        final start = RegExp(r'bytes (\d+)-').firstMatch(cr);
+        final total = int.parse(m.group(1)!);
+        final startOffset = start != null ? int.parse(start.group(1)!) : 0;
+        return total - startOffset; // bytes expected in THIS response
+      }
+    }
+    // Otherwise use Content-Length
+    final cl = resp.headers['content-length'];
+    if (cl != null) {
+      return int.tryParse(cl);
+    }
+    return null;
   }
 
   /// Best-guess MIME type from file extension when upstream omits Content-Type.
