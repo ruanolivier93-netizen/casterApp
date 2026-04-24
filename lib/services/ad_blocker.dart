@@ -491,21 +491,44 @@ tp-yt-paper-dialog.ytd-popup-container,
   z-index: -9999 !important;
 }
 
-/* ── PROTECT actual video players — never hide ── */
+/* ── PROTECT actual video players — never hide ──
+   Includes the <video> element AND any ancestor wrapper that contains
+   one (via :has()). This prevents over-eager substring class matchers
+   like [class*="ad-block"] or [class*="overlay-ad"] from hiding a player
+   wrapper named e.g. "video-ad-block" or "player-overlay-adapter". */
 video,
+audio,
 video *,
-[class*="video-player"] video,
-[class*="videoPlayer"] video,
-[class*="video-js"] video,
-[class*="plyr"] video,
-[class*="jw-video"] video,
-[class*="html5-video"] video,
-.html5-video-player video,
-.video-stream {
+audio *,
+[class*="video-player" i],
+[class*="videoPlayer"  i],
+[class*="video-js"     i],
+[class*="vjs-"         i],
+[class*="plyr"         i],
+[class*="jw-video"     i],
+[class*="jwplayer"     i],
+[class*="html5-video"  i],
+[class*="flowplayer"   i],
+[class*="bitmovin"     i],
+[class*="shaka-"       i],
+[class*="theoplayer"   i],
+[class*="mediaelement" i],
+[class*="hls-player"   i],
+[class*="dash-player"  i],
+[class*="player-container" i],
+[class*="media-player" i],
+[class*="clappr"       i],
+.html5-video-player,
+.video-stream,
+:has(> video),
+:has(> audio),
+[class*="player" i]:has(video),
+[class*="video"  i]:has(video) {
   display: revert !important;
   visibility: visible !important;
   height: revert !important;
   max-height: revert !important;
+  min-height: revert !important;
   overflow: revert !important;
   pointer-events: auto !important;
   opacity: 1 !important;
@@ -527,6 +550,39 @@ video *,
   if (window.__rlEarlyGuard) return;
   window.__rlEarlyGuard = true;
 
+  /* ── Detect video-heavy hosts where we tone down the aggressive layers.
+     On these sites we skip addEventListener interception and click-hijack
+     handler-source matching, both of which can break custom video players. */
+  var __videoHostHints = [
+    'youtube.com', 'youtu.be', 'youtube-nocookie.com',
+    'vimeo.com', 'player.vimeo.com',
+    'twitch.tv', 'dailymotion.com', 'facebook.com', 'fb.watch',
+    'instagram.com', 'tiktok.com', 'reddit.com',
+    'netflix.com', 'primevideo.com', 'amazon.com', 'hulu.com',
+    'disneyplus.com', 'hbomax.com', 'max.com', 'paramountplus.com',
+    'peacocktv.com', 'showmax.com', 'sabc.co.za', 'dstv.com',
+    'streamable.com', 'jwplayer.com', 'wistia.com',
+    'twitter.com', 'x.com',
+    /* common embed/player hosts */
+    'jwplatform.com', 'flowplayer.com', 'theoplayer.com', 'plyr.io',
+    'videojs.com', 'bitmovin.com', 'mux.com', 'cloudflarestream.com'
+  ];
+  var __h = (location.hostname || '').toLowerCase();
+  var __isVideoHost = false;
+  for (var __i = 0; __i < __videoHostHints.length; __i++) {
+    if (__h === __videoHostHints[__i] || __h.endsWith('.' + __videoHostHints[__i])) {
+      __isVideoHost = true; break;
+    }
+  }
+  /* Pages with the keyword 'embed', 'player' or 'watch' in the path are
+     also treated as video pages. */
+  var __p = (location.pathname || '').toLowerCase();
+  if (!__isVideoHost && (__p.indexOf('/embed') !== -1 ||
+      __p.indexOf('/player') !== -1 || __p.indexOf('/watch') !== -1)) {
+    __isVideoHost = true;
+  }
+  window.__rlIsVideoHost = __isVideoHost;
+
   /* ── Suppress error / adblock alert() dialogs ── */
   var origAlert = window.alert;
   window.alert = function(msg) {
@@ -534,79 +590,82 @@ video *,
     var s = String(msg).toLowerCase();
     if (s.indexOf('typeerror') !== -1 || s.indexOf('referenceerror') !== -1 ||
         s.indexOf('cannot read') !== -1 || s.indexOf('is not defined') !== -1 ||
-        s.indexOf('undefined') !== -1 || s.indexOf('null') !== -1 ||
         s.indexOf('classlist') !== -1 || s.indexOf('adblock') !== -1 ||
         s.indexOf('ad block') !== -1 || s.indexOf('adblocker') !== -1 ||
-        s.indexOf('disable your') !== -1 || s.indexOf('whitelist') !== -1 ||
-        s.indexOf('refresh page') !== -1 || s.indexOf('try again') !== -1 ||
-        s.indexOf('blocked') !== -1 || s.indexOf('error') !== -1) {
+        s.indexOf('disable your') !== -1 || s.indexOf('whitelist') !== -1) {
       return;
     }
     return origAlert.call(window, msg);
   };
 
-  /* ── Block window.open (redirect to NewTab channel for legit links) ── */
-  window.open = function(url) {
-    if (url) {
-      try {
-        var resolved = new URL(url, location.href).href;
-        var lower = resolved.toLowerCase();
-        var dominated =
-          lower.indexOf('doubleclick') !== -1 || lower.indexOf('googlesyndication') !== -1 ||
-          lower.indexOf('popads') !== -1 || lower.indexOf('popunder') !== -1 ||
-          lower.indexOf('adnxs') !== -1 || lower.indexOf('clickadu') !== -1 ||
-          lower.indexOf('exoclick') !== -1 || lower.indexOf('hilltopads') !== -1 ||
-          lower.indexOf('propellerads') !== -1 || lower.indexOf('trafficjunky') !== -1 ||
-          lower.indexOf('juicyads') !== -1 || lower.indexOf('trafficstars') !== -1 ||
-          lower.indexOf('adsterra') !== -1 || lower.indexOf('admaven') !== -1 ||
-          lower.indexOf('adf.ly') !== -1 || lower.indexOf('/ads/') !== -1 ||
-          lower.indexOf('/ad/click') !== -1 || lower.indexOf('click_id=') !== -1 ||
-          lower.indexOf('aff_id=') !== -1 || lower.indexOf('smartlink') !== -1;
-        if (!dominated) {
-          try { NewTab.postMessage(resolved); } catch(_) {}
-        }
-      } catch(_) {}
-    }
-    return null;
+  /* ── Block ad popups via window.open. We return a *fake* window object
+     instead of null so player code that does `var w = window.open(...);
+     w.focus()` doesn't crash. ── */
+  var __fakeWin = {
+    closed: true, focus: function(){}, blur: function(){}, close: function(){},
+    postMessage: function(){}, document: { write: function(){}, close: function(){} },
+    location: { href: '', assign: function(){}, replace: function(){} },
+    addEventListener: function(){}, removeEventListener: function(){}
   };
-
-  /* ── Block location.href setter hijacking ── */
-  try {
-    var origDesc = Object.getOwnPropertyDescriptor(window, 'location') ||
-                   Object.getOwnPropertyDescriptor(Window.prototype, 'location');
-    if (origDesc && origDesc.set) {
-      // Can't redefine location itself, but we can catch assignment in a proxy-like way
-    }
-  } catch(_) {}
-
-  /* ── First-click hijack protection ── */
-  var __rlFirstClick = true;
-  document.addEventListener('click', function(e) {
-    if (!__rlFirstClick) return;
-    __rlFirstClick = false;
-    /* On many ad-infested sites the first click anywhere opens an ad URL.
-       If it navigated to a different domain, block it. */
-  }, true);
-
-  /* ── Intercept addEventListener to block document-level click hijack handlers ── */
-  var origAddEvent = EventTarget.prototype.addEventListener;
-  EventTarget.prototype.addEventListener = function(type, fn, opts) {
-    if ((type === 'click' || type === 'mousedown' || type === 'pointerdown' || type === 'auxclick') &&
-        (this === document || this === document.documentElement ||
-         this === document.body || this === window)) {
-      var src = '';
-      try { src = fn.toString().substring(0, 500); } catch(_) {}
-      var sl = src.toLowerCase();
-      if (sl.indexOf('window.open') !== -1 || sl.indexOf('location.href') !== -1 ||
-          sl.indexOf('location.assign') !== -1 || sl.indexOf('location.replace') !== -1 ||
-          sl.indexOf('click_url') !== -1 || sl.indexOf('redirect') !== -1 ||
-          sl.indexOf('popunder') !== -1 || sl.indexOf('.href=') !== -1 ||
-          sl.indexOf('window.location') !== -1) {
-        return; /* silently block */
+  window.open = function(url, target, features) {
+    if (!url) return __fakeWin;
+    try {
+      var resolved = new URL(url, location.href).href;
+      var lower = resolved.toLowerCase();
+      var dominated =
+        lower.indexOf('doubleclick') !== -1 || lower.indexOf('googlesyndication') !== -1 ||
+        lower.indexOf('popads') !== -1 || lower.indexOf('popunder') !== -1 ||
+        lower.indexOf('adnxs') !== -1 || lower.indexOf('clickadu') !== -1 ||
+        lower.indexOf('exoclick') !== -1 || lower.indexOf('hilltopads') !== -1 ||
+        lower.indexOf('propellerads') !== -1 || lower.indexOf('trafficjunky') !== -1 ||
+        lower.indexOf('juicyads') !== -1 || lower.indexOf('trafficstars') !== -1 ||
+        lower.indexOf('adsterra') !== -1 || lower.indexOf('admaven') !== -1 ||
+        lower.indexOf('adf.ly') !== -1 || lower.indexOf('/ads/') !== -1 ||
+        lower.indexOf('/ad/click') !== -1 || lower.indexOf('click_id=') !== -1 ||
+        lower.indexOf('aff_id=') !== -1 || lower.indexOf('smartlink') !== -1;
+      if (!dominated) {
+        try { NewTab.postMessage(resolved); } catch(_) {}
       }
-    }
-    return origAddEvent.call(this, type, fn, opts);
+    } catch(_) {}
+    return __fakeWin;
   };
+
+  /* ── Intercept addEventListener to block document-level click hijack
+     handlers — but ONLY on non-video hosts. Many video players legitimately
+     register document-level handlers that mention 'location' or '.href'. ── */
+  if (!__isVideoHost) {
+    var origAddEvent = EventTarget.prototype.addEventListener;
+    EventTarget.prototype.addEventListener = function(type, fn, opts) {
+      if ((type === 'click' || type === 'mousedown' ||
+           type === 'pointerdown' || type === 'auxclick') &&
+          (this === document || this === document.documentElement ||
+           this === document.body || this === window)) {
+        var src = '';
+        try { src = fn.toString().substring(0, 500); } catch(_) {}
+        var sl = src.toLowerCase();
+        /* Require BOTH a redirect-like call AND an ad-network signal to
+           classify as hijack. This avoids killing legitimate handlers. */
+        var hasRedir =
+          sl.indexOf('window.open') !== -1 || sl.indexOf('popunder') !== -1 ||
+          sl.indexOf('clickunder') !== -1 || sl.indexOf('zone_id') !== -1 ||
+          sl.indexOf('zoneid') !== -1 || sl.indexOf('ad_url') !== -1 ||
+          sl.indexOf('click_url') !== -1;
+        var hasAdNet =
+          sl.indexOf('doubleclick') !== -1 || sl.indexOf('googlesyndication') !== -1 ||
+          sl.indexOf('adnxs') !== -1 || sl.indexOf('popads') !== -1 ||
+          sl.indexOf('exoclick') !== -1 || sl.indexOf('propellerads') !== -1 ||
+          sl.indexOf('hilltopads') !== -1 || sl.indexOf('juicyads') !== -1;
+        if (hasRedir && hasAdNet) {
+          return; /* silently block real popunder hijack handler */
+        }
+        if (sl.indexOf('window.open("http') !== -1 ||
+            sl.indexOf("window.open('http") !== -1) {
+          return; /* hard-coded popup URL — hijack */
+        }
+      }
+      return origAddEvent.call(this, type, fn, opts);
+    };
+  }
 
   /* ── Block string-based setTimeout/setInterval (ad redirects) ── */
   var origSetTimeout = window.setTimeout;
@@ -615,7 +674,7 @@ video *,
     if (typeof fn === 'string') {
       var sl = fn.toLowerCase();
       if (sl.indexOf('location') !== -1 || sl.indexOf('window.open') !== -1 ||
-          sl.indexOf('pop') !== -1 || sl.indexOf('redirect') !== -1) {
+          sl.indexOf('popunder') !== -1) {
         return 0;
       }
     }
@@ -734,44 +793,55 @@ video *,
   function nuke() {
     document.querySelectorAll(AD_SEL).forEach(function(el) {
       if (isVideoPlayer(el)) return;
-      if (el.closest && el.closest('video, [class*="video-player"], [class*="video-js"], [class*="plyr"], .html5-video-player')) return;
+      if (el.querySelector && (el.querySelector('video') || el.querySelector('audio'))) return;
+      if (el.closest && el.closest('video, audio, [class*="video-player"], [class*="video-js"], [class*="plyr"], [class*="jwplayer"], [class*="player-container"], .html5-video-player')) return;
       el.remove();
     });
 
-    /* Remove fixed/sticky overlays that block content */
-    document.querySelectorAll('div, section, aside, span').forEach(function(el) {
-      var s;
-      try { s = getComputedStyle(el); } catch(_) { return; }
-      if (s.position !== 'fixed' && s.position !== 'sticky') return;
-      var tag = el.tagName.toLowerCase();
-      if (tag === 'header' || tag === 'nav') return;
-      if (isVideoPlayer(el)) return;
+    /* Remove fixed/sticky overlays that block content. SOFTENED: skip on
+       video hosts, and skip wrappers that contain media. */
+    if (window.__rlIsVideoHost) {
+      // Still re-enable scrolling below.
+    } else {
+      document.querySelectorAll('div, section, aside, span').forEach(function(el) {
+        var s;
+        try { s = getComputedStyle(el); } catch(_) { return; }
+        if (s.position !== 'fixed' && s.position !== 'sticky') return;
+        var tag = el.tagName.toLowerCase();
+        if (tag === 'header' || tag === 'nav') return;
+        if (isVideoPlayer(el)) return;
+        if (el.querySelector && (el.querySelector('video') || el.querySelector('audio'))) return;
 
-      var r = el.getBoundingClientRect();
-      var z = parseInt(s.zIndex, 10) || 0;
-
-      /* Full-screen overlays (modals, interstitials) */
-      if (r.width > window.innerWidth * 0.75 && r.height > window.innerHeight * 0.6 && z > 500) {
-        el.remove();
-        return;
-      }
-      /* Bottom sticky banners */
-      if (r.height < 150 && r.bottom >= window.innerHeight - 5 && z > 5) {
-        el.remove();
-        return;
-      }
-      /* Top sticky banners (not nav) */
-      if (r.height < 120 && r.top <= 5 && z > 5) {
-        var cls = (el.className || '').toLowerCase();
+        var r = el.getBoundingClientRect();
+        var z = parseInt(s.zIndex, 10) || 0;
+        var cls = (el.className || '').toString().toLowerCase();
         var id = (el.id || '').toLowerCase();
-        if (cls.indexOf('ad') !== -1 || id.indexOf('ad') !== -1 ||
-            cls.indexOf('banner') !== -1 || id.indexOf('banner') !== -1 ||
-            cls.indexOf('promo') !== -1) {
+        var hasAdSignal = cls.indexOf('ad') !== -1 || id.indexOf('ad') !== -1 ||
+                          cls.indexOf('promo') !== -1 || cls.indexOf('sponsor') !== -1 ||
+                          cls.indexOf('banner') !== -1 || cls.indexOf('popup') !== -1 ||
+                          cls.indexOf('interstitial') !== -1;
+
+        /* Full-screen overlays (modals, interstitials) — only remove with ad signal. */
+        if (r.width > window.innerWidth * 0.75 && r.height > window.innerHeight * 0.6 && z > 500 && hasAdSignal) {
           el.remove();
           return;
         }
-      }
-    });
+        /* Bottom sticky banners with ad signal */
+        if (r.height < 150 && r.bottom >= window.innerHeight - 5 && z > 5 && hasAdSignal) {
+          el.remove();
+          return;
+        }
+        /* Top sticky banners (not nav) */
+        if (r.height < 120 && r.top <= 5 && z > 5) {
+          if (cls.indexOf('ad') !== -1 || id.indexOf('ad') !== -1 ||
+              cls.indexOf('banner') !== -1 || id.indexOf('banner') !== -1 ||
+              cls.indexOf('promo') !== -1) {
+            el.remove();
+            return;
+          }
+        }
+      });
+    }
 
     /* Re-enable scrolling if a modal locked it */
     ['body', 'html'].forEach(function(sel) {
@@ -877,7 +947,15 @@ video *,
     };
   })();
 
-  /* ══ Redirect window.open to new tab (block if ad) ══ */
+  /* ══ Redirect window.open to new tab (block if ad). Returns a fake window
+   * object instead of null so player code that does `var w=window.open();
+   * w.focus()` doesn't crash. ══ */
+  var __jsFakeWin = {
+    closed: true, focus: function(){}, blur: function(){}, close: function(){},
+    postMessage: function(){}, document: { write: function(){}, close: function(){} },
+    location: { href: '', assign: function(){}, replace: function(){} },
+    addEventListener: function(){}, removeEventListener: function(){}
+  };
   window.open = function(url) {
     if (url) {
       try {
@@ -887,7 +965,7 @@ video *,
         }
       } catch(_) {}
     }
-    return null;
+    return __jsFakeWin;
   };
 
   /* ══ Ad-redirect URL detection (shared helper) ══ */
@@ -1029,37 +1107,37 @@ video *,
     } catch(_) {}
   })();
 
-  /* ══ Remove invisible clickjack overlays ══ */
+  /* ══ Remove invisible clickjack overlays
+   *    SOFTENED: skips elements that contain a <video>/<audio>, and skips
+   *    entirely on video hosts. ══ */
   function removeClickjackOverlays() {
+    if (window.__rlIsVideoHost) return;
     document.querySelectorAll('div, a, span, section, aside, iframe').forEach(function(el) {
       var s;
       try { s = getComputedStyle(el); } catch(_) { return; }
       if (s.position !== 'fixed' && s.position !== 'absolute') return;
       if (isVideoPlayer(el)) return;
+      /* Never touch wrappers that contain a media element. */
+      if (el.querySelector && (el.querySelector('video') || el.querySelector('audio') || el.querySelector('iframe[src*="youtube"], iframe[src*="vimeo"], iframe[src*="player"]'))) return;
       var z = parseInt(s.zIndex, 10) || 0;
       var opacity = parseFloat(s.opacity);
       var r = el.getBoundingClientRect();
       var isLarge = r.width > window.innerWidth * 0.3 && r.height > window.innerHeight * 0.3;
       var isFullScreen = r.width > window.innerWidth * 0.8 && r.height > window.innerHeight * 0.8;
 
-      /* Full-screen overlay iframes (ad takeovers) */
-      if (el.tagName === 'IFRAME' && isFullScreen && z > 10) { el.remove(); return; }
-
-      /* Invisible or nearly-invisible large overlay (z > 10 is enough) */
-      if (isLarge && opacity <= 0.15 && z > 10) { el.remove(); return; }
-      /* Large overlay with very high z-index regardless of opacity */
-      if (isLarge && z > 9000) {
-        var cls = (el.className || '').toLowerCase();
-        var id = (el.id || '').toLowerCase();
-        /* Don't remove modals/menus that seem legitimate */
-        if (cls.indexOf('modal') === -1 && cls.indexOf('menu') === -1 &&
-            cls.indexOf('nav') === -1 && cls.indexOf('player') === -1 &&
-            id.indexOf('player') === -1) {
-          el.remove(); return;
+      /* Full-screen overlay iframes (ad takeovers) — only if iframe src looks ad-y */
+      if (el.tagName === 'IFRAME' && isFullScreen && z > 10) {
+        var src = (el.src || '').toLowerCase();
+        if (isAdRedirect(src) || src.indexOf('ads') !== -1 || src.indexOf('doubleclick') !== -1) {
+          el.remove();
         }
+        return;
       }
+
+      /* Invisible or nearly-invisible large overlay (z > 50, opacity ≤ 0.05) */
+      if (isLarge && opacity <= 0.05 && z > 50) { el.remove(); return; }
       /* Transparent <a> covering the viewport (classic clickjack) */
-      if (el.tagName === 'A' && isLarge && z > 50) { el.remove(); return; }
+      if (el.tagName === 'A' && isLarge && z > 50 && opacity <= 0.2) { el.remove(); return; }
       /* Small transparent overlays positioned over interactive elements */
       if (el.tagName === 'A' && opacity <= 0.01 && z > 50) { el.remove(); return; }
       /* Zero-size iframes used for tracking */
@@ -1134,29 +1212,36 @@ video *,
     }, true);
   });
 
-  /* ══ Strip ALL document/body click listeners that sites add for popunders ══ */
+  /* ══ Strip document/body click listeners that look like popunders.
+   *    SOFTENED: requires both a redirect-like call AND an ad-network signal,
+   *    or a hard-coded popup URL. Disabled entirely on video hosts. ══ */
   (function() {
+    if (window.__rlIsVideoHost) return;
     var origAddELDoc = EventTarget.prototype.addEventListener;
-    var HIJACK_EVENTS = ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'auxclick', 'contextmenu'];
+    var HIJACK_EVENTS = ['click', 'mousedown', 'mouseup', 'pointerdown', 'pointerup', 'auxclick'];
     EventTarget.prototype.addEventListener = function(type, fn, opts) {
       if (type === 'beforeunload' && this === window) return;
-      /* Block sites from adding click/mouse hijack listeners to document, body, html */
       if (HIJACK_EVENTS.indexOf(type) !== -1 &&
           (this === document || this === document.body || this === document.documentElement || this === window)) {
-        /* Allow our own RL Caster listeners (they set __rlCaster flag) */
         if (fn && fn.__rlCaster) {
           return origAddELDoc.call(this, type, fn, opts);
         }
-        /* Allow legitimate-looking handlers (e.g. frameworks that need document-level delegation) */
         var fnStr = '';
         try { fnStr = fn.toString().substring(0, 500).toLowerCase(); } catch(_) {}
-        if (fnStr.indexOf('window.open') !== -1 || fnStr.indexOf('location.href') !== -1 ||
-            fnStr.indexOf('location.assign') !== -1 || fnStr.indexOf('location.replace') !== -1 ||
-            fnStr.indexOf('popup') !== -1 || fnStr.indexOf('popunder') !== -1 ||
-            fnStr.indexOf('redirect') !== -1 || fnStr.indexOf('clickunder') !== -1 ||
-            fnStr.indexOf('.href=') !== -1 || fnStr.indexOf('zone_id') !== -1 ||
-            fnStr.indexOf('zoneid') !== -1 || fnStr.indexOf('ad_url') !== -1) {
-          return; /* block: this is a hijack handler */
+        var hasRedir =
+          fnStr.indexOf('window.open') !== -1 || fnStr.indexOf('popunder') !== -1 ||
+          fnStr.indexOf('clickunder') !== -1 || fnStr.indexOf('zone_id') !== -1 ||
+          fnStr.indexOf('zoneid') !== -1 || fnStr.indexOf('ad_url') !== -1;
+        var hasAdNet =
+          fnStr.indexOf('doubleclick') !== -1 || fnStr.indexOf('googlesyndication') !== -1 ||
+          fnStr.indexOf('adnxs') !== -1 || fnStr.indexOf('popads') !== -1 ||
+          fnStr.indexOf('exoclick') !== -1 || fnStr.indexOf('propellerads') !== -1 ||
+          fnStr.indexOf('hilltopads') !== -1 || fnStr.indexOf('juicyads') !== -1 ||
+          fnStr.indexOf('trafficstars') !== -1 || fnStr.indexOf('adsterra') !== -1;
+        if ((hasRedir && hasAdNet) ||
+            fnStr.indexOf('window.open("http') !== -1 ||
+            fnStr.indexOf("window.open('http") !== -1) {
+          return; /* block: real popunder hijack */
         }
       }
       return origAddELDoc.call(this, type, fn, opts);
