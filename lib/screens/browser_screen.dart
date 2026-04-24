@@ -258,6 +258,20 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   }
 
   List<UserScript> _initialScripts(bool adBlockEnabled) {
+    // Strategy (Brave / AdGuard / uBO Lite mobile model):
+    //   1. Network-level URL blocking via native ContentBlocker (handled in
+    //      `_buildContentBlockers()` and applied through InAppWebViewSettings).
+    //   2. Cosmetic CSS hiding via `_cssInjectionScript` — purely declarative,
+    //      cannot break page JS (the `:has(video)` PROTECT block in
+    //      `AdBlocker.cssRules` re-shows any wrapper that contains a player).
+    //   3. A tiny `_bridgeScript` so target=_blank links can open as new tabs.
+    //   4. Video detector (always on, regardless of ad-block) so the Cast
+    //      button can find playable streams.
+    //
+    // We deliberately do NOT inject any DOM-walking / event-intercepting JS:
+    // overriding `window.open`, `addEventListener`, `setTimeout` strings, or
+    // walking the DOM with `getComputedStyle` reliably breaks legitimate
+    // video players (HLS.js, JW Player, video.js, custom HTML5 wrappers).
     final scripts = <UserScript>[
       UserScript(
         source: AdBlocker.videoDetectorScript,
@@ -268,20 +282,12 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     if (adBlockEnabled) {
       scripts.insertAll(0, [
         UserScript(
-          source: AdBlocker.earlyJsScript,
-          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
-        ),
-        UserScript(
           source: _bridgeScript,
           injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
         ),
         UserScript(
           source: _cssInjectionScript,
           injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
-        ),
-        UserScript(
-          source: AdBlocker.jsScript,
-          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
         ),
       ]);
     }
@@ -315,10 +321,11 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   }
 
   Future<void> _injectAdBlockScripts(InAppWebViewController controller) async {
+    // Re-inject the lightweight layers (bridge + CSS) when ad-block is toggled
+    // on at runtime. Heavy DOM/event-intercepting JS is intentionally NOT
+    // injected — see `_initialScripts()` for rationale.
     await controller.evaluateJavascript(source: _bridgeScript);
     await controller.evaluateJavascript(source: _cssInjectionScript);
-    await controller.evaluateJavascript(source: AdBlocker.earlyJsScript);
-    await controller.evaluateJavascript(source: AdBlocker.jsScript);
     await controller.evaluateJavascript(source: AdBlocker.videoDetectorScript);
   }
 
