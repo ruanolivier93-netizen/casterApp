@@ -8,11 +8,11 @@
     <!-- Keep CPU alive while proxying a stream in foreground -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- Foreground service to keep proxy alive while screen off / app backgrounded.
-         We use dataSync (not mediaPlayback) because the phone only proxies bytes
-         to the TV; no audio is rendered locally, so we don't want to appear in
-         the system audio-routing UI / headphones picker. -->
+         mediaPlayback is the correct type per Google's docs for casting/
+         streaming media to a remote device, and is required for the proxy
+         server to keep accepting Chromecast connections in the background. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <!-- Post notification for foreground service (Android 13+) -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Storage for downloading videos (Android 12 and below) -->
@@ -70,7 +70,7 @@
         <service
             android:name=".CastForegroundService"
             android:exported="false"
-            android:foregroundServiceType="dataSync" />
+            android:foregroundServiceType="mediaPlayback" />
         <!-- Don't delete the meta-data below.
              This is used by the Flutter tool to generate GeneratedPluginRegistrant.java -->
         <meta-data

@@ -196,11 +196,14 @@ class ChromecastService {
       },
     };
 
-    // Pass known duration so the receiver shows a seek bar and the TV
-    // remote (CEC media keys, Google TV app) can scrub forward/back.
-    if (durationSeconds != null && durationSeconds > 0) {
-      media['duration'] = durationSeconds.toDouble();
-    }
+    // NOTE: We intentionally do NOT pass `duration` here. Some Default Media
+    // Receiver versions return LOAD_FAILED / 'format not supported' if the
+    // declared duration disagrees with what the decoder discovers from the
+    // container. The receiver detects duration from the container itself and
+    // exposes a working seek bar (which the TV remote can drive) without us
+    // having to tell it.
+    // ignore: unused_local_variable
+    final _ = durationSeconds;
 
     // Add subtitle track if provided
     final tracks = <Map<String, dynamic>>[];

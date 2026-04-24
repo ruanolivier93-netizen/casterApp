@@ -68,14 +68,17 @@ class CastForegroundService : Service() {
                 val notification = buildNotification(title)
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    // Use DATA_SYNC instead of MEDIA_PLAYBACK so Android does
-                    // NOT treat the app as a local audio player (which causes
-                    // it to appear in the audio output / headphones picker).
-                    // We're only proxying bytes to the TV; no local audio.
+                    // mediaPlayback is required for casting per Google's
+                    // foreground-service-type docs ("Use this for casting/
+                    // streaming media to a remote device") and lets the
+                    // proxy keep accepting Chromecast connections while the
+                    // app is backgrounded. The notification below is built
+                    // without MediaStyle / a media-play icon, which is what
+                    // keeps Android from registering us as an audio output.
                     startForeground(
                         NOTIFICATION_ID,
                         notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
                     )
                 } else {
                     startForeground(NOTIFICATION_ID, notification)
@@ -137,10 +140,15 @@ class CastForegroundService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("RL Caster")
             .setContentText(title)
-            // Use a neutral upload/sync icon (NOT ic_media_play) so the system
-            // does not classify this as an active local audio player.
+            // Use the system-info icon (NOT a media-play icon) so the
+            // notification is not classified as an active local-audio session.
+            // The combination of mediaPlayback FGS type + non-media icon +
+            // CATEGORY_SERVICE + no MediaStyle keeps Android from showing the
+            // app in the audio-output / headphones picker.
             .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setOngoing(true)
+            .setShowWhen(false)
+            .setOnlyAlertOnce(true)
             .setContentIntent(pendingOpen)
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
