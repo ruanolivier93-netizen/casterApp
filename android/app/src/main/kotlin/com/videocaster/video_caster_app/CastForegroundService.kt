@@ -68,10 +68,14 @@ class CastForegroundService : Service() {
                 val notification = buildNotification(title)
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    // Use DATA_SYNC instead of MEDIA_PLAYBACK so Android does
+                    // NOT treat the app as a local audio player (which causes
+                    // it to appear in the audio output / headphones picker).
+                    // We're only proxying bytes to the TV; no local audio.
                     startForeground(
                         NOTIFICATION_ID,
                         notification,
-                        ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
                     )
                 } else {
                     startForeground(NOTIFICATION_ID, notification)
@@ -133,7 +137,9 @@ class CastForegroundService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("RL Caster")
             .setContentText(title)
-            .setSmallIcon(android.R.drawable.ic_media_play)
+            // Use a neutral upload/sync icon (NOT ic_media_play) so the system
+            // does not classify this as an active local audio player.
+            .setSmallIcon(android.R.drawable.stat_sys_upload)
             .setOngoing(true)
             .setContentIntent(pendingOpen)
             .addAction(

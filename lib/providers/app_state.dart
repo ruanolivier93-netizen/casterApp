@@ -375,6 +375,7 @@ class CastNotifier extends StateNotifier<CastState> {
             title: title,
             contentType: contentType ?? _guessChromecastMime(format.url),
             subtitleUrl: subtitleUrl,
+            durationSeconds: effectiveDuration,
           );
         } else {
           // ── DLNA flow ──

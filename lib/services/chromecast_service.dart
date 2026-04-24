@@ -159,6 +159,7 @@ class ChromecastService {
     required String title,
     String contentType = 'video/mp4',
     String? subtitleUrl,
+    int? durationSeconds,
   }) async {
     // Launch Default Media Receiver
     final launchResp = await _sendRequest(
@@ -194,6 +195,12 @@ class ChromecastService {
         'title': title,
       },
     };
+
+    // Pass known duration so the receiver shows a seek bar and the TV
+    // remote (CEC media keys, Google TV app) can scrub forward/back.
+    if (durationSeconds != null && durationSeconds > 0) {
+      media['duration'] = durationSeconds.toDouble();
+    }
 
     // Add subtitle track if provided
     final tracks = <Map<String, dynamic>>[];
