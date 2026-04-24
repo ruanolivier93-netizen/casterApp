@@ -123,39 +123,51 @@ class _MainShellState extends ConsumerState<MainShell> {
             : Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // Mini player — visible on all tabs when casting
+            // Mini player — smooth animated entrance above nav bar
             const MiniPlayer(),
-            NavigationBar(
-              selectedIndex: _tabIndex,
-              onDestinationSelected: (i) {
-                if (i == 1 && !_browserInitialised) {
-                  setState(() {
-                    _browserInitialised = true;
-                    _tabIndex = i;
-                  });
-                } else {
-                  setState(() => _tabIndex = i);
-                }
-              },
-              height: 64,
-              indicatorColor: cs.primaryContainer,
-              destinations: const [
-                NavigationDestination(
-                  icon: Icon(Icons.cast_outlined),
-                  selectedIcon: Icon(Icons.cast),
-                  label: 'Cast',
+            // Nav bar with a subtle top divider
+            DecoratedBox(
+              decoration: BoxDecoration(
+                border: Border(
+                  top: BorderSide(
+                    color: Theme.of(context).colorScheme.outlineVariant
+                        .withAlpha(60),
+                    width: 0.8,
+                  ),
                 ),
-                NavigationDestination(
-                  icon: Icon(Icons.language_outlined),
-                  selectedIcon: Icon(Icons.language),
-                  label: 'Browse',
-                ),
-                NavigationDestination(
-                  icon: Icon(Icons.folder_outlined),
-                  selectedIcon: Icon(Icons.folder),
-                  label: 'Files',
-                ),
-              ],
+              ),
+              child: NavigationBar(
+                selectedIndex: _tabIndex,
+                onDestinationSelected: (i) {
+                  if (i == 1 && !_browserInitialised) {
+                    setState(() {
+                      _browserInitialised = true;
+                      _tabIndex = i;
+                    });
+                  } else {
+                    setState(() => _tabIndex = i);
+                  }
+                },
+                height: 64,
+                indicatorColor: cs.primaryContainer,
+                destinations: const [
+                  NavigationDestination(
+                    icon: Icon(Icons.cast_outlined),
+                    selectedIcon: Icon(Icons.cast),
+                    label: 'Cast',
+                  ),
+                  NavigationDestination(
+                    icon: Icon(Icons.language_outlined),
+                    selectedIcon: Icon(Icons.language),
+                    label: 'Browse',
+                  ),
+                  NavigationDestination(
+                    icon: Icon(Icons.folder_outlined),
+                    selectedIcon: Icon(Icons.folder),
+                    label: 'Files',
+                  ),
+                ],
+              ),
             ),
           ],
         ),

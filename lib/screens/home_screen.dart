@@ -1,7 +1,15 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:cached_network_image/cached_network_image.dart';
+import 'package:file_picker/file_picker.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:path_provider/path_provider.dart';
 import '../providers/app_state.dart';
+import '../providers/bookmarks_history.dart';
+import '../providers/privacy_telemetry.dart';
 import '../providers/queue_provider.dart';
 import '../services/subtitle_service.dart';
 import '../models/video_info.dart';
@@ -91,78 +99,125 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
       ),
       body: ListView(
         controller: _scroll,
-        padding: const EdgeInsets.fromLTRB(16, 8, 16, 100),
-        children: [
-          // ── URL input ────────────────────────────────────────────────────
+        padding: const EdgeInsets.fromLTRB(16, 12, 16, 120),        children: [
+          // ── URL input (always visible) ───────────────────────────────────
           _buildUrlInput(videoState, cs),
 
-          // ── Cast History (shown when idle) ────────────────────────────────
-          if (videoState is VideoIdle) ...[
-            const SizedBox(height: 12),
-            const _CastHistory(),
-          ],
+          // ── Animated content area — no layout jumps ──────────────────────
+          AnimatedSize(
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeInOut,
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // Cast History (idle only)
+                if (videoState is VideoIdle) ...[
+                  const SizedBox(height: 16),
+                  const _CastHistory(),
+                ],
 
-          // ── Video info + format picker + device + cast button ─────────────
-          if (videoState is VideoLoaded) ...[
-            const SizedBox(height: 12),
-            _VideoInfoCard(info: videoState.info),
-            const SizedBox(height: 12),
-            _FormatPicker(info: videoState.info),
-          ],
+                // Video info + format picker
+                if (videoState is VideoLoaded) ...[
+                  const SizedBox(height: 16),
+                  _VideoInfoCard(info: videoState.info),
+                  const SizedBox(height: 12),
+                  _FormatPicker(info: videoState.info),
+                ],
 
-          // ── Device selection (shown once we have a video) ────────────────
-          if (videoState is VideoLoaded) ...[
-            const SizedBox(height: 12),
-            _DeviceSection(
-              devicesState: devicesState,
-              selectedDevice: selectedDevice,
+                // Device selection
+                if (videoState is VideoLoaded) ...[
+                  const SizedBox(height: 12),
+                  _DeviceSection(
+                    devicesState: devicesState,
+                    selectedDevice: selectedDevice,
+                  ),
+                ],
+
+                // Big cast button
+                AnimatedSize(
+                  duration: const Duration(milliseconds: 250),
+                  curve: Curves.easeInOut,
+                  child: videoState is VideoLoaded &&
+                          selectedFormat != null &&
+                          selectedDevice != null &&
+                          castState is! CastPlaying &&
+                          castState is! CastPreparing
+                      ? Padding(
+                          padding: const EdgeInsets.only(top: 16),
+                          child: _CastNowButton(
+                            videoState: videoState,
+                            format: selectedFormat,
+                            device: selectedDevice,
+                          ),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+
+                // Cast controls — AnimatedSwitcher for smooth state changes
+                AnimatedSize(
+                  duration: const Duration(milliseconds: 300),
+                  curve: Curves.easeInOut,
+                  child: (isCasting ||
+                          castState is CastPreparing ||
+                          castState is CastError)
+                      ? Padding(
+                          padding: const EdgeInsets.only(top: 12),
+                          child: AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 350),
+                            switchInCurve: Curves.easeOut,
+                            switchOutCurve: Curves.easeIn,
+                            transitionBuilder: (child, anim) => FadeTransition(
+                              opacity: anim,
+                              child: SlideTransition(
+                                position: Tween<Offset>(
+                                  begin: const Offset(0, 0.04),
+                                  end: Offset.zero,
+                                ).animate(anim),
+                                child: child,
+                              ),
+                            ),
+                            child: _CastControls(
+                              key: ValueKey(castState.runtimeType),
+                              videoState: videoState,
+                            ),
+                          ),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+
+                // Queue
+                const SizedBox(height: 12),
+                const _QueueSection(),
+
+                // Route toggle — inline card, no footer jumps
+                const SizedBox(height: 12),
+                const _RouteToggleBar(),
+
+                // Subtitle search
+                AnimatedSize(
+                  duration: const Duration(milliseconds: 250),
+                  curve: Curves.easeInOut,
+                  child: videoState is VideoLoaded
+                      ? Padding(
+                          padding: const EdgeInsets.only(top: 12),
+                          child: _SubtitleSearchSection(
+                              title: videoState.info.title),
+                        )
+                      : const SizedBox.shrink(),
+                ),
+              ],
             ),
-          ],
-
-          // ── BIG CAST BUTTON — the star of the show ───────────────────────
-          if (videoState is VideoLoaded &&
-              selectedFormat != null &&
-              selectedDevice != null &&
-              castState is! CastPlaying &&
-              castState is! CastPreparing) ...[
-            const SizedBox(height: 16),
-            _CastNowButton(
-              videoState: videoState,
-              format: selectedFormat,
-              device: selectedDevice,
-            ),
-          ],
-
-          // ── Cast controls ────────────────────────────────────────────────
-          if (isCasting || castState is CastPreparing || castState is CastError) ...[
-            const SizedBox(height: 12),
-            _CastControls(videoState: videoState),
-          ],
-
-          // ── Queue ───────────────────────────────────────────────────────
-          const SizedBox(height: 12),
-          const _QueueSection(),
-
-          // ── Subtitle Search ─────────────────────────────────────────────
-          if (videoState is VideoLoaded) ...[
-            const SizedBox(height: 12),
-            _SubtitleSearchSection(title: videoState.info.title),
-          ],
+          ),
         ],
       ),
-      persistentFooterButtons: [const _RouteToggleBar()],
     );
   }
 
   Widget _buildUrlInput(VideoState videoState, ColorScheme cs) {
     return Card(
-      elevation: 0,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16),
-        side: BorderSide(color: cs.outlineVariant),
-      ),
+      color: cs.surfaceContainerLow,
       child: Padding(
-        padding: const EdgeInsets.all(16),
+        padding: const EdgeInsets.all(14),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
@@ -170,35 +225,59 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
               controller: _urlController,
               decoration: InputDecoration(
                 hintText: 'Paste YouTube URL or direct video link…',
-                prefixIcon: const Icon(Icons.link),
+                prefixIcon: Icon(Icons.link_rounded,
+                    color: cs.onSurfaceVariant, size: 20),
                 suffixIcon: videoState is VideoLoading
-                    ? const Padding(
-                        padding: EdgeInsets.all(12),
+                    ? Padding(
+                        padding: const EdgeInsets.all(13),
                         child: SizedBox(
-                          width: 20, height: 20,
-                          child: CircularProgressIndicator(strokeWidth: 2),
+                          width: 18,
+                          height: 18,
+                          child: CircularProgressIndicator(
+                              strokeWidth: 2.5, color: cs.primary),
                         ),
                       )
                     : IconButton(
-                        icon: const Icon(Icons.search),
+                        icon: Icon(Icons.search_rounded, color: cs.primary),
                         onPressed: _extract,
+                        tooltip: 'Extract video',
                       ),
-                border: const OutlineInputBorder(),
               ),
               keyboardType: TextInputType.url,
               textInputAction: TextInputAction.go,
               onSubmitted: (_) => _extract(),
             ),
-            if (videoState is VideoError) ...[
-              const SizedBox(height: 8),
-              _ErrorBanner(videoState.message),
-              const SizedBox(height: 6),
-              TextButton.icon(
-                icon: const Icon(Icons.refresh, size: 16),
-                label: const Text('Retry'),
-                onPressed: _extract,
-              ),
-            ],
+            // Error state — inline, no layout jump
+            AnimatedSize(
+              duration: const Duration(milliseconds: 200),
+              curve: Curves.easeOut,
+              child: videoState is VideoError
+                  ? Padding(
+                      padding: const EdgeInsets.only(top: 10),
+                      child: Row(
+                        children: [
+                          Icon(Icons.error_outline,
+                              size: 16, color: cs.error),
+                          const SizedBox(width: 8),
+                          Expanded(
+                            child: Text(
+                              videoState.message,
+                              style: TextStyle(
+                                  fontSize: 12, color: cs.error),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                            ),
+                          ),
+                          TextButton(
+                            onPressed: _extract,
+                            child: const Text('Retry',
+                                style: TextStyle(fontSize: 12)),
+                          ),
+                        ],
+                      ),
+                    )
+                  : const SizedBox.shrink(),
+            ),
           ],
         ),
       ),
@@ -247,7 +326,8 @@ class _VideoInfoCard extends StatelessWidget {
               height: 66,
               fit: BoxFit.cover,
               errorWidget: (_, __, ___) => Container(
-                width: 110, height: 66,
+                width: 110,
+                height: 66,
                 color: cs.surfaceContainerHighest,
                 child: const Icon(Icons.video_file),
               ),
@@ -259,13 +339,16 @@ class _VideoInfoCard extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               Text(info.title,
-                  style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                  maxLines: 2, overflow: TextOverflow.ellipsis),
+                  style: const TextStyle(
+                      fontWeight: FontWeight.w600, fontSize: 14),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis),
               const SizedBox(height: 4),
               Text(
                 [
                   if (info.uploader != null) info.uploader!,
-                  if (info.durationSeconds != null) _fmtDuration(info.durationSeconds),
+                  if (info.durationSeconds != null)
+                    _fmtDuration(info.durationSeconds),
                   '${info.formats.length} format${info.formats.length == 1 ? '' : 's'}',
                 ].join(' · '),
                 style: TextStyle(color: cs.onSurfaceVariant, fontSize: 12),
@@ -287,7 +370,9 @@ class _FormatPicker extends ConsumerWidget {
   String _fmtSize(int? bytes) {
     if (bytes == null) return '';
     final mb = bytes / (1024 * 1024);
-    return mb >= 1024 ? '${(mb / 1024).toStringAsFixed(1)} GB' : '${mb.toStringAsFixed(0)} MB';
+    return mb >= 1024
+        ? '${(mb / 1024).toStringAsFixed(1)} GB'
+        : '${mb.toStringAsFixed(0)} MB';
   }
 
   @override
@@ -305,8 +390,11 @@ class _FormatPicker extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text('Quality', style: TextStyle(
-          fontWeight: FontWeight.w600, fontSize: 13, color: cs.onSurfaceVariant)),
+        Text('Quality',
+            style: TextStyle(
+                fontWeight: FontWeight.w600,
+                fontSize: 13,
+                color: cs.onSurfaceVariant)),
         const SizedBox(height: 6),
         ...info.formats.map((f) {
           final isSelected = selected?.id == f.id;
@@ -325,22 +413,30 @@ class _FormatPicker extends ConsumerWidget {
                   borderRadius: BorderRadius.circular(10),
                   color: isSelected ? cs.primaryContainer.withAlpha(80) : null,
                 ),
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                 child: Row(
                   children: [
                     Icon(
-                      f.hasAudio ? Icons.hd_rounded : Icons.videocam_off_outlined,
+                      f.hasAudio
+                          ? Icons.hd_rounded
+                          : Icons.videocam_off_outlined,
                       size: 20,
                       color: isSelected ? cs.primary : cs.onSurfaceVariant,
                     ),
                     const SizedBox(width: 10),
-                    Expanded(child: Text(f.label, style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
-                    ))),
+                    Expanded(
+                        child: Text(f.label,
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: isSelected
+                                  ? FontWeight.w600
+                                  : FontWeight.normal,
+                            ))),
                     if (f.filesize != null)
                       Text(_fmtSize(f.filesize),
-                          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                          style: TextStyle(
+                              fontSize: 12, color: cs.onSurfaceVariant)),
                     if (isSelected) ...[
                       const SizedBox(width: 8),
                       Icon(Icons.check_circle, size: 18, color: cs.primary),
@@ -355,8 +451,11 @@ class _FormatPicker extends ConsumerWidget {
         // Subtitles
         if (info.subtitles.isNotEmpty) ...[
           const SizedBox(height: 10),
-          Text('Subtitles', style: TextStyle(
-            fontWeight: FontWeight.w600, fontSize: 13, color: cs.onSurfaceVariant)),
+          Text('Subtitles',
+              style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                  color: cs.onSurfaceVariant)),
           const SizedBox(height: 6),
           _SubtitlePicker(subtitles: info.subtitles),
         ],
@@ -375,18 +474,21 @@ class _SubtitlePicker extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final selected = ref.watch(selectedSubtitleProvider);
     return Wrap(
-      spacing: 6, runSpacing: 4,
+      spacing: 6,
+      runSpacing: 4,
       children: [
         ChoiceChip(
           label: const Text('None', style: TextStyle(fontSize: 12)),
           selected: selected == null,
-          onSelected: (_) => ref.read(selectedSubtitleProvider.notifier).state = null,
+          onSelected: (_) =>
+              ref.read(selectedSubtitleProvider.notifier).state = null,
           visualDensity: VisualDensity.compact,
         ),
         ...subtitles.map((s) => ChoiceChip(
               label: Text(s.label, style: const TextStyle(fontSize: 12)),
               selected: selected?.language == s.language,
-              onSelected: (_) => ref.read(selectedSubtitleProvider.notifier).state = s,
+              onSelected: (_) =>
+                  ref.read(selectedSubtitleProvider.notifier).state = s,
               visualDensity: VisualDensity.compact,
             )),
       ],
@@ -399,7 +501,8 @@ class _SubtitlePicker extends ConsumerWidget {
 class _DeviceSection extends ConsumerWidget {
   final DevicesState devicesState;
   final DlnaDevice? selectedDevice;
-  const _DeviceSection({required this.devicesState, required this.selectedDevice});
+  const _DeviceSection(
+      {required this.devicesState, required this.selectedDevice});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -421,8 +524,11 @@ class _DeviceSection extends ConsumerWidget {
     }
 
     // Auto-select last used device as soon as it appears
-    if (selectedDevice == null && lastDeviceLocation != null && devices.isNotEmpty) {
-      final match = devices.where((d) => d.location == lastDeviceLocation).firstOrNull;
+    if (selectedDevice == null &&
+        lastDeviceLocation != null &&
+        devices.isNotEmpty) {
+      final match =
+          devices.where((d) => d.location == lastDeviceLocation).firstOrNull;
       if (match != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           ref.read(selectedDeviceProvider.notifier).state = match;
@@ -444,14 +550,21 @@ class _DeviceSection extends ConsumerWidget {
           children: [
             Icon(Icons.tv, size: 18, color: cs.onSurfaceVariant),
             const SizedBox(width: 6),
-            Text('Cast to', style: TextStyle(
-              fontWeight: FontWeight.w600, fontSize: 13, color: cs.onSurfaceVariant)),
+            Text('Cast to',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 13,
+                    color: cs.onSurfaceVariant)),
             const Spacer(),
             if (isScanning) ...[
-              SizedBox(width: 14, height: 14,
-                child: CircularProgressIndicator(strokeWidth: 2, color: cs.primary)),
+              SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 2, color: cs.primary)),
               const SizedBox(width: 6),
-              Text('Scanning…', style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+              Text('Scanning…',
+                  style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
             ] else
               TextButton.icon(
                 icon: const Icon(Icons.refresh, size: 14),
@@ -461,7 +574,6 @@ class _DeviceSection extends ConsumerWidget {
           ],
         ),
         const SizedBox(height: 6),
-
         if (devices.isEmpty && !isScanning && devicesState is! DevicesIdle)
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 8),
@@ -480,14 +592,12 @@ class _DeviceSection extends ConsumerWidget {
               ],
             ),
           ),
-
         if (devices.isEmpty && (isScanning || devicesState is DevicesIdle))
           Padding(
             padding: const EdgeInsets.symmetric(vertical: 8),
             child: Text('Looking for TVs on your network…',
                 style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13)),
           ),
-
         ...devices.map((d) {
           final isSelected = selectedDevice == d;
           return Padding(
@@ -502,10 +612,13 @@ class _DeviceSection extends ConsumerWidget {
                 ),
               ),
               tileColor: isSelected ? cs.primaryContainer.withAlpha(80) : null,
-              leading: Icon(Icons.tv, color: isSelected ? cs.primary : cs.onSurfaceVariant, size: 22),
+              leading: Icon(Icons.tv,
+                  color: isSelected ? cs.primary : cs.onSurfaceVariant,
+                  size: 22),
               title: Text(d.name,
                   style: TextStyle(
-                    fontWeight: isSelected ? FontWeight.w600 : FontWeight.normal,
+                    fontWeight:
+                        isSelected ? FontWeight.w600 : FontWeight.normal,
                     fontSize: 14,
                   )),
               subtitle: d.manufacturer.isNotEmpty
@@ -518,7 +631,6 @@ class _DeviceSection extends ConsumerWidget {
             ),
           );
         }),
-
         if (devicesState is DevicesError) ...[
           const SizedBox(height: 8),
           _ErrorBanner((devicesState as DevicesError).message),
@@ -554,12 +666,11 @@ class _CastNowButton extends ConsumerWidget {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
-        FilledButton.icon(
-          icon: const Icon(Icons.cast, size: 22),
-          label: Text('Cast to ${device.name}'),
+        FilledButton(
           style: FilledButton.styleFrom(
-            padding: const EdgeInsets.symmetric(vertical: 16),
-            textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            padding: const EdgeInsets.symmetric(vertical: 18),
+            shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(16)),
             backgroundColor: cs.primary,
             foregroundColor: cs.onPrimary,
           ),
@@ -569,37 +680,51 @@ class _CastNowButton extends ConsumerWidget {
             final sub = selectedSub ?? (subs.isNotEmpty ? subs.first : null);
 
             ref.read(castHistoryProvider.notifier).add(
-              videoState.sourceUrl,
-              videoState.info.title,
-              videoState.info.thumbnailUrl,
-            );
+                  videoState.sourceUrl,
+                  videoState.info.title,
+                  videoState.info.thumbnailUrl,
+                );
             ref.read(lastDeviceProvider.notifier).save(device.location);
 
             ref.read(castProvider.notifier).cast(
-              device: device,
-              format: format,
-              title: videoState.info.title,
-              routeThroughPhone: settings.routeThroughPhone,
-              subtitleSrt: sub?.srtContent,
-              durationSeconds: videoState.info.durationSeconds,
-            );
+                  device: device,
+                  format: format,
+                  title: videoState.info.title,
+                  routeThroughPhone: settings.routeThroughPhone,
+                  subtitleSrt: sub?.srtContent,
+                  durationSeconds: videoState.info.durationSeconds,
+                );
           },
-        ),
-        const SizedBox(height: 6),
-        Row(children: [
-          Icon(Icons.tv, size: 12, color: cs.onSurfaceVariant),
-          const SizedBox(width: 4),
-          Text(device.name,
-              style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
-          const SizedBox(width: 12),
-          Icon(Icons.hd_rounded, size: 12, color: cs.onSurfaceVariant),
-          const SizedBox(width: 4),
-          Expanded(
-            child: Text(format.label,
-                style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-                overflow: TextOverflow.ellipsis),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const Icon(Icons.cast_rounded, size: 22),
+              const SizedBox(width: 10),
+              Flexible(
+                child: Text(
+                  'Cast to ${device.name}',
+                  style: const TextStyle(
+                      fontSize: 16, fontWeight: FontWeight.w700),
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+            ],
           ),
-        ]),
+        ),
+        const SizedBox(height: 8),
+        Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.hd_rounded, size: 13, color: cs.onSurfaceVariant),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text(format.label,
+                  style: TextStyle(
+                      fontSize: 12, color: cs.onSurfaceVariant),
+                  overflow: TextOverflow.ellipsis),
+            ),
+          ],
+        ),
       ],
     );
   }
@@ -609,7 +734,7 @@ class _CastNowButton extends ConsumerWidget {
 
 class _CastControls extends ConsumerStatefulWidget {
   final VideoState? videoState;
-  const _CastControls({this.videoState});
+  const _CastControls({super.key, this.videoState});
 
   @override
   ConsumerState<_CastControls> createState() => _CastControlsState();
@@ -619,6 +744,7 @@ class _CastControlsState extends ConsumerState<_CastControls> {
   double? _volume;
   bool _volumeLoading = false;
   bool _volumeFetched = false;
+  double? _dragSeekValue;
 
   Future<void> _fetchVolume(DlnaDevice device) async {
     if (_volumeLoading || _volumeFetched) return;
@@ -650,21 +776,29 @@ class _CastControlsState extends ConsumerState<_CastControls> {
   Widget build(BuildContext context) {
     final castState = ref.watch(castProvider);
     final progress = ref.watch(castPositionProvider);
+    final seekInFlight = ref.watch(castSeekInFlightProvider);
     final cs = Theme.of(context).colorScheme;
 
     if (castState is CastError) {
       return Card(
-        elevation: 0,
-        color: cs.errorContainer.withAlpha(60),
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+        color: cs.errorContainer.withAlpha(80),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
         child: Padding(
-          padding: const EdgeInsets.all(16),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
+          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+          child: Row(
             children: [
-              _ErrorBanner(castState.message),
-              const SizedBox(height: 10),
-              OutlinedButton(
+              Icon(Icons.error_outline, color: cs.error, size: 20),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(
+                  castState.message,
+                  style: TextStyle(
+                      fontSize: 13, color: cs.onErrorContainer),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                ),
+              ),
+              TextButton(
                 onPressed: () => ref.read(castProvider.notifier).stop(),
                 child: const Text('Dismiss'),
               ),
@@ -676,15 +810,21 @@ class _CastControlsState extends ConsumerState<_CastControls> {
 
     if (castState is CastPreparing) {
       return Card(
-        elevation: 0,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-        child: const Padding(
-          padding: EdgeInsets.all(24),
-          child: Column(
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 28, horizontal: 24),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              CircularProgressIndicator(),
-              SizedBox(height: 12),
-              Text('Starting stream…'),
+              SizedBox(
+                width: 20,
+                height: 20,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2.5, color: cs.primary),
+              ),
+              const SizedBox(width: 16),
+              Text('Starting stream…',
+                  style: TextStyle(
+                      fontSize: 14, color: cs.onSurfaceVariant)),
             ],
           ),
         ),
@@ -702,79 +842,180 @@ class _CastControlsState extends ConsumerState<_CastControls> {
       final pos = progress.position.inSeconds.clamp(0, total > 0 ? total : 1);
 
       return Card(
-        elevation: 2,
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-        color: cs.primaryContainer.withAlpha(40),
+        color: cs.primaryContainer.withAlpha(30),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(18)),
         child: Padding(
-          padding: const EdgeInsets.all(16),
+          padding: const EdgeInsets.fromLTRB(16, 14, 16, 12),
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.stretch,
             children: [
-              // Now playing
+              // ── Now playing header ────────────────────────────────────
               Row(children: [
-                Icon(Icons.cast_connected, color: cs.primary, size: 22),
-                const SizedBox(width: 8),
+                Container(
+                  width: 34,
+                  height: 34,
+                  decoration: BoxDecoration(
+                    color: cs.primary,
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Icon(Icons.cast_connected,
+                      color: cs.onPrimary, size: 18),
+                ),
+                const SizedBox(width: 10),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
                     children: [
                       Text(castState.title,
-                          style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 14),
-                          maxLines: 1, overflow: TextOverflow.ellipsis),
-                      Text('on ${castState.device.name}',
-                          style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                          style: const TextStyle(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 14),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis),
+                      Row(children: [
+                        Icon(Icons.tv_rounded,
+                            size: 11, color: cs.onSurfaceVariant),
+                        const SizedBox(width: 3),
+                        Flexible(
+                          child: Text(castState.device.name,
+                              style: TextStyle(
+                                  fontSize: 11,
+                                  color: cs.onSurfaceVariant),
+                              overflow: TextOverflow.ellipsis),
+                        ),
+                        if (castState.routedThroughPhone) ...[
+                          const SizedBox(width: 6),
+                          Icon(Icons.phone_android,
+                              size: 11, color: cs.tertiary),
+                        ],
+                      ]),
                     ],
                   ),
                 ),
-                if (castState.routedThroughPhone)
-                  Tooltip(
-                    message: 'Routing through phone',
-                    child: Icon(Icons.phone_android, size: 16, color: cs.tertiary),
-                  ),
               ]),
 
-              // Progress
+              // ── Seek indicator ────────────────────────────────────────
+              AnimatedSize(
+                duration: const Duration(milliseconds: 200),
+                child: seekInFlight
+                    ? Padding(
+                        padding: const EdgeInsets.only(top: 8),
+                        child: ClipRRect(
+                          borderRadius: BorderRadius.circular(2),
+                          child: LinearProgressIndicator(
+                            minHeight: 2,
+                            color: cs.primary,
+                          ),
+                        ),
+                      )
+                    : const SizedBox.shrink(),
+              ),
+
+              // ── Progress bar ──────────────────────────────────────────
               if (total > 0) ...[
-                const SizedBox(height: 12),
+                const SizedBox(height: 8),
                 SliderTheme(
-                  data: SliderTheme.of(context).copyWith(trackHeight: 3),
+                  data: SliderTheme.of(context).copyWith(
+                    trackHeight: 3.5,
+                    thumbShape:
+                        const RoundSliderThumbShape(enabledThumbRadius: 7),
+                    overlayShape:
+                        const RoundSliderOverlayShape(overlayRadius: 14),
+                  ),
                   child: Slider(
-                    value: pos.toDouble(),
+                    value: (_dragSeekValue ?? pos.toDouble())
+                        .clamp(0.0, total.toDouble()),
                     min: 0,
                     max: total.toDouble(),
-                    onChanged: (v) {},
-                    onChangeEnd: (v) =>
-                        ref.read(castProvider.notifier).seek(Duration(seconds: v.toInt())),
+                    onChangeStart: (v) =>
+                        setState(() => _dragSeekValue = v),
+                    onChanged: (v) => setState(() => _dragSeekValue = v),
+                    onChangeEnd: (v) async {
+                      setState(() => _dragSeekValue = null);
+                      final ok = await ref
+                          .read(castProvider.notifier)
+                          .seek(Duration(seconds: v.toInt()));
+                      if (!ok && context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                              content:
+                                  Text('Seek failed. Please try again.')),
+                        );
+                      }
+                    },
                   ),
                 ),
                 Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      Text(_fmt(progress.position), style: const TextStyle(fontSize: 11)),
-                      Text(_fmt(progress.total), style: const TextStyle(fontSize: 11)),
+                      Text(_fmt(progress.position),
+                          style: TextStyle(
+                              fontSize: 11,
+                              color: cs.onSurfaceVariant,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures()
+                              ])),
+                      Text(_fmt(progress.total),
+                          style: TextStyle(
+                              fontSize: 11,
+                              color: cs.onSurfaceVariant,
+                              fontFeatures: const [
+                                FontFeature.tabularFigures()
+                              ])),
                     ],
                   ),
                 ),
               ],
 
-              const SizedBox(height: 12),
+              const SizedBox(height: 6),
 
-              // Controls
+              // ── Playback controls ─────────────────────────────────────
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceEvenly,
                 children: [
-                  IconButton.filled(
-                    icon: Icon(castState.isPaused ? Icons.play_arrow : Icons.pause, size: 28),
-                    iconSize: 28,
-                    onPressed: () => ref.read(castProvider.notifier).pauseResume(),
-                    tooltip: castState.isPaused ? 'Resume' : 'Pause',
+                  // Rewind
+                  _ControlButton(
+                    icon: Icons.replay_10_rounded,
+                    tooltip: 'Rewind 10s',
+                    onTap: () async {
+                      final ok = await ref
+                          .read(castProvider.notifier)
+                          .seekRelative(const Duration(seconds: -10));
+                      if (!ok && context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                              content: Text('Rewind failed.')),
+                        );
+                      }
+                    },
                   ),
-                  FilledButton.tonalIcon(
-                    icon: const Icon(Icons.stop),
-                    label: const Text('Stop'),
-                    onPressed: () {
+                  // Play / Pause (big)
+                  _PlayPauseButton(isPaused: castState.isPaused),
+                  // Forward
+                  _ControlButton(
+                    icon: Icons.forward_10_rounded,
+                    tooltip: 'Forward 10s',
+                    onTap: () async {
+                      final ok = await ref
+                          .read(castProvider.notifier)
+                          .seekRelative(const Duration(seconds: 10));
+                      if (!ok && context.mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          const SnackBar(
+                              content: Text('Forward seek failed.')),
+                        );
+                      }
+                    },
+                  ),
+                  // Stop
+                  _ControlButton(
+                    icon: Icons.stop_rounded,
+                    tooltip: 'Stop casting',
+                    color: cs.error,
+                    onTap: () {
                       setState(() {
                         _volume = null;
                         _volumeFetched = false;
@@ -785,28 +1026,27 @@ class _CastControlsState extends ConsumerState<_CastControls> {
                 ],
               ),
 
-              // Volume
-              ...[
-                const SizedBox(height: 8),
-                Row(
-                  children: [
-                    const Icon(Icons.volume_down, size: 18),
-                    Expanded(
-                      child: Slider(
-                        value: (_volume ?? 50).clamp(0, 100).toDouble(),
-                        min: 0, max: 100, divisions: 20,
-                        label: '${(_volume ?? 50).round()}',
-                        onChanged: (v) => setState(() => _volume = v),
-                        onChangeEnd: (v) => _setVolume(castState.device, v),
-                      ),
+              // ── Volume ────────────────────────────────────────────────
+              Row(
+                children: [
+                  Icon(Icons.volume_down_rounded,
+                      size: 17, color: cs.onSurfaceVariant),
+                  Expanded(
+                    child: Slider(
+                      value: (_volume ?? 50).clamp(0, 100).toDouble(),
+                      min: 0,
+                      max: 100,
+                      divisions: 20,
+                      onChanged: (v) => setState(() => _volume = v),
+                      onChangeEnd: (v) => _setVolume(castState.device, v),
                     ),
-                    const Icon(Icons.volume_up, size: 18),
-                  ],
-                ),
-              ],
+                  ),
+                  Icon(Icons.volume_up_rounded,
+                      size: 17, color: cs.onSurfaceVariant),
+                ],
+              ),
 
-              // Sleep timer
-              const SizedBox(height: 4),
+              // ── Sleep timer ───────────────────────────────────────────
               _SleepTimerButton(),
             ],
           ),
@@ -822,6 +1062,71 @@ class _CastControlsState extends ConsumerState<_CastControls> {
     final m = (d.inMinutes % 60).toString().padLeft(2, '0');
     final s = (d.inSeconds % 60).toString().padLeft(2, '0');
     return h > 0 ? '$h:$m:$s' : '$m:$s';
+  }
+}
+
+// ── Playback control helper widgets ─────────────────────────────────────────
+
+class _ControlButton extends StatelessWidget {
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback onTap;
+  final Color? color;
+  const _ControlButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onTap,
+    this.color,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: tooltip,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(40),
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Icon(icon, size: 26, color: color ?? cs.onSurface),
+        ),
+      ),
+    );
+  }
+}
+
+class _PlayPauseButton extends ConsumerWidget {
+  final bool isPaused;
+  const _PlayPauseButton({required this.isPaused});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final cs = Theme.of(context).colorScheme;
+    return Tooltip(
+      message: isPaused ? 'Resume' : 'Pause',
+      child: InkWell(
+        onTap: () => ref.read(castProvider.notifier).pauseResume(),
+        borderRadius: BorderRadius.circular(40),
+        child: Container(
+          width: 52,
+          height: 52,
+          decoration: BoxDecoration(
+            color: cs.primary,
+            shape: BoxShape.circle,
+          ),
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 200),
+            child: Icon(
+              isPaused ? Icons.play_arrow_rounded : Icons.pause_rounded,
+              key: ValueKey(isPaused),
+              color: cs.onPrimary,
+              size: 30,
+            ),
+          ),
+        ),
+      ),
+    );
   }
 }
 
@@ -843,8 +1148,11 @@ class _CastHistory extends ConsumerWidget {
           children: [
             Icon(Icons.history, size: 18, color: cs.onSurfaceVariant),
             const SizedBox(width: 6),
-            Text('Recently Cast', style: TextStyle(
-              fontWeight: FontWeight.w600, fontSize: 14, color: cs.onSurfaceVariant)),
+            Text('Recently Cast',
+                style: TextStyle(
+                    fontWeight: FontWeight.w600,
+                    fontSize: 14,
+                    color: cs.onSurfaceVariant)),
             const Spacer(),
             TextButton(
               onPressed: () => ref.read(castHistoryProvider.notifier).clear(),
@@ -861,9 +1169,12 @@ class _CastHistory extends ConsumerWidget {
                       borderRadius: BorderRadius.circular(4),
                       child: Image.network(
                         item.thumbnailUrl!,
-                        width: 48, height: 28, fit: BoxFit.cover,
+                        width: 48,
+                        height: 28,
+                        fit: BoxFit.cover,
                         errorBuilder: (_, __, ___) => Container(
-                          width: 48, height: 28,
+                          width: 48,
+                          height: 28,
                           color: cs.surfaceContainerHighest,
                           child: const Icon(Icons.video_file, size: 16),
                         ),
@@ -871,7 +1182,8 @@ class _CastHistory extends ConsumerWidget {
                     )
                   : Icon(Icons.play_circle_outline, color: cs.primary),
               title: Text(item.title,
-                  maxLines: 1, overflow: TextOverflow.ellipsis,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
                   style: const TextStyle(fontSize: 13)),
               subtitle: Text(_timeAgo(item.castAt),
                   style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
@@ -937,34 +1249,38 @@ class _RouteToggleBar extends ConsumerWidget {
     final cs = Theme.of(context).colorScheme;
     final active = settings.routeThroughPhone;
 
-    return SafeArea(
-      child: Container(
-        padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-        decoration: BoxDecoration(
-          color: active
-              ? cs.secondaryContainer.withAlpha(200)
-              : cs.surfaceContainerHighest.withAlpha(160),
-          border: Border(top: BorderSide(color: cs.outlineVariant)),
-        ),
+    return Card(
+      color: active
+          ? cs.secondaryContainer.withAlpha(180)
+          : cs.surfaceContainerLow,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
         child: Row(
           children: [
-            Icon(Icons.phone_android, size: 20,
+            Icon(Icons.phone_android,
+                size: 20,
                 color: active ? cs.secondary : cs.onSurfaceVariant),
-            const SizedBox(width: 10),
+            const SizedBox(width: 12),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Text('Route through phone', style: TextStyle(
-                    fontWeight: FontWeight.w600, fontSize: 13,
-                    color: active ? cs.onSecondaryContainer : cs.onSurface,
-                  )),
+                  Text(
+                    'Route through phone',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w600,
+                      fontSize: 13,
+                      color:
+                          active ? cs.onSecondaryContainer : cs.onSurface,
+                    ),
+                  ),
                   Text(
                     active
                         ? 'Phone proxies the stream to your TV'
                         : 'TV fetches stream directly from internet',
-                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
+                    style:
+                        TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
                   ),
                 ],
               ),
@@ -1032,13 +1348,15 @@ class _QueueSection extends ConsumerWidget {
               leading: isCurrent
                   ? Icon(Icons.play_arrow, color: cs.primary, size: 20)
                   : Text('${i + 1}',
-                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                      style:
+                          TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
               title: Text(item.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
                   style: TextStyle(
                       fontSize: 13,
-                      fontWeight: isCurrent ? FontWeight.w600 : FontWeight.normal)),
+                      fontWeight:
+                          isCurrent ? FontWeight.w600 : FontWeight.normal)),
               trailing: IconButton(
                 icon: const Icon(Icons.cast, size: 16),
                 tooltip: 'Cast this',
@@ -1086,15 +1404,31 @@ class _SubtitleSearchSectionState
     });
     try {
       final results = await service.search(query: widget.title);
-      if (mounted) setState(() => _results = results);
+      if (mounted) {
+        setState(() => _results = results);
+      }
     } on SubtitleApiKeyMissing catch (e) {
-      if (mounted) setState(() { _error = e.toString(); _isKeyError = true; });
+      if (mounted) {
+        setState(() {
+          _error = e.toString();
+          _isKeyError = true;
+        });
+      }
     } on SubtitleApiKeyInvalid catch (e) {
-      if (mounted) setState(() { _error = e.toString(); _isKeyError = true; });
+      if (mounted) {
+        setState(() {
+          _error = e.toString();
+          _isKeyError = true;
+        });
+      }
     } catch (e) {
-      if (mounted) setState(() => _error = e.toString());
+      if (mounted) {
+        setState(() => _error = e.toString());
+      }
     } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted) {
+        setState(() => _loading = false);
+      }
     }
   }
 
@@ -1146,7 +1480,8 @@ class _SubtitleSearchSectionState
             const Spacer(),
             if (_loading)
               const SizedBox(
-                width: 16, height: 16,
+                width: 16,
+                height: 16,
                 child: CircularProgressIndicator(strokeWidth: 2),
               )
             else
@@ -1176,7 +1511,8 @@ class _SubtitleSearchSectionState
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(_error!, style: TextStyle(fontSize: 12, color: cs.onSurface)),
+                  Text(_error!,
+                      style: TextStyle(fontSize: 12, color: cs.onSurface)),
                   const SizedBox(height: 6),
                   Text(
                     '1. Go to opensubtitles.com/en/consumers\n'
@@ -1208,7 +1544,8 @@ class _SubtitleSearchSectionState
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: const TextStyle(fontSize: 12)),
-                subtitle: Text('${sub.language} · ${sub.downloadCount} downloads',
+                subtitle: Text(
+                    '${sub.language} · ${sub.downloadCount} downloads',
                     style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
                 trailing: IconButton(
                   icon: Icon(Icons.download, size: 16, color: cs.primary),
@@ -1249,7 +1586,9 @@ class _SleepTimerButton extends ConsumerWidget {
           if (isActive) {
             castNotifier.cancelSleepTimer();
             ScaffoldMessenger.of(context).showSnackBar(
-              const SnackBar(content: Text('Sleep timer cancelled'), duration: Duration(seconds: 2)),
+              const SnackBar(
+                  content: Text('Sleep timer cancelled'),
+                  duration: Duration(seconds: 2)),
             );
           } else {
             _showTimerPicker(context, castNotifier);
@@ -1274,12 +1613,15 @@ class _SleepTimerButton extends ConsumerWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text('Sleep Timer',
-                    style: TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
+                    style:
+                        TextStyle(fontWeight: FontWeight.w600, fontSize: 16)),
                 const SizedBox(height: 12),
                 ...[15, 30, 45, 60, 90, 120].map((m) => ListTile(
                       dense: true,
                       leading: const Icon(Icons.timer, size: 20),
-                      title: Text(m >= 60 ? '${m ~/ 60} hour${m > 60 ? 's' : ''}${m % 60 > 0 ? ' ${m % 60} min' : ''}' : '$m minutes'),
+                      title: Text(m >= 60
+                          ? '${m ~/ 60} hour${m > 60 ? 's' : ''}${m % 60 > 0 ? ' ${m % 60} min' : ''}'
+                          : '$m minutes'),
                       onTap: () {
                         notifier.setSleepTimer(Duration(minutes: m));
                         Navigator.pop(ctx);
@@ -1349,13 +1691,24 @@ class _SettingsSheetState extends ConsumerState<_SettingsSheet> {
             value: settings.routeThroughPhone,
             onChanged: (_) => ref.read(settingsProvider.notifier).toggle(),
           ),
+          SwitchListTile(
+            contentPadding: EdgeInsets.zero,
+            title: const Text('Ad blocker in browser'),
+            subtitle: const Text(
+              'Blocks ad/tracker requests and popup redirects in the in-app browser.',
+            ),
+            value: settings.adBlockEnabled,
+            onChanged: (_) =>
+                ref.read(settingsProvider.notifier).toggleAdBlock(),
+          ),
           const Divider(),
           ListTile(
             contentPadding: EdgeInsets.zero,
             leading: const Icon(Icons.subtitles_outlined),
             title: const Text('OpenSubtitles API Key'),
             subtitle: settings.hasSubtitleKey
-                ? Text('Key configured (${settings.openSubtitlesApiKey.substring(0, 4)}…)',
+                ? Text(
+                    'Key configured (${settings.openSubtitlesApiKey.substring(0, 4)}…)',
                     style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant))
                 : Text('Not configured — subtitles won\u2019t work',
                     style: TextStyle(fontSize: 12, color: cs.error)),
@@ -1373,7 +1726,8 @@ class _SettingsSheetState extends ConsumerState<_SettingsSheet> {
                         ? cs.primary
                         : cs.outlineVariant),
                 onPressed: () {
-                  ref.read(settingsProvider.notifier)
+                  ref
+                      .read(settingsProvider.notifier)
                       .setSubtitleApiKey(_apiKeyController.text);
                   FocusScope.of(context).unfocus();
                   ScaffoldMessenger.of(context).showSnackBar(
@@ -1399,6 +1753,41 @@ class _SettingsSheetState extends ConsumerState<_SettingsSheet> {
           const Divider(),
           ListTile(
             contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.privacy_tip_outlined),
+            title: const Text('Data and privacy controls'),
+            subtitle: const Text(
+              'Retention limits, startup clearing, backup and restore',
+            ),
+            onTap: () {
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                shape: const RoundedRectangleBorder(
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+                ),
+                builder: (_) => const _PrivacySheet(),
+              );
+            },
+          ),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
+            leading: const Icon(Icons.analytics_outlined),
+            title: const Text('Telemetry events'),
+            subtitle: const Text('View local reliability diagnostics'),
+            onTap: () {
+              showModalBottomSheet(
+                context: context,
+                isScrollControlled: true,
+                shape: const RoundedRectangleBorder(
+                  borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+                ),
+                builder: (_) => const _TelemetrySheet(),
+              );
+            },
+          ),
+          const Divider(),
+          ListTile(
+            contentPadding: EdgeInsets.zero,
             leading: const Icon(Icons.info_outline),
             title: const Text('Supported sources'),
             subtitle: const Text(
@@ -1410,6 +1799,308 @@ class _SettingsSheetState extends ConsumerState<_SettingsSheet> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _PrivacySheet extends ConsumerStatefulWidget {
+  const _PrivacySheet();
+
+  @override
+  ConsumerState<_PrivacySheet> createState() => _PrivacySheetState();
+}
+
+class _PrivacySheetState extends ConsumerState<_PrivacySheet> {
+  static const _limitOptions = [50, 100, 250, 500, 1000];
+
+  Future<void> _exportData() async {
+    final bookmarks = ref.read(bookmarksProvider.notifier).exportJson();
+    final history = ref.read(historyProvider.notifier).exportJson();
+    final castHistory = ref.read(castHistoryProvider.notifier).exportJson();
+    final telemetry = ref.read(telemetryProvider.notifier).exportJson();
+    final privacy = ref.read(privacySettingsProvider);
+
+    final payload = {
+      'version': 1,
+      'exportedAt': DateTime.now().toIso8601String(),
+      'privacy': {
+        'bookmarksLimit': privacy.bookmarksLimit,
+        'historyLimit': privacy.historyLimit,
+        'clearBrowsingDataOnStart': privacy.clearBrowsingDataOnStart,
+        'telemetryEnabled': privacy.telemetryEnabled,
+      },
+      'bookmarks': bookmarks,
+      'history': history,
+      'castHistory': castHistory,
+      'telemetry': telemetry,
+    };
+
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File(
+      '${dir.path}${Platform.pathSeparator}video_caster_backup_${DateTime.now().millisecondsSinceEpoch}.json',
+    );
+    await file
+        .writeAsString(const JsonEncoder.withIndent('  ').convert(payload));
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Backup saved to ${file.path}')),
+    );
+  }
+
+  Future<void> _importData() async {
+    final picked = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['json'],
+      withData: false,
+    );
+    final path = picked?.files.single.path;
+    if (path == null) return;
+
+    final raw = await File(path).readAsString();
+    final decoded = jsonDecode(raw) as Map<String, dynamic>;
+
+    final bookmarksRaw = decoded['bookmarks'] as List? ?? const [];
+    final historyRaw = decoded['history'] as List? ?? const [];
+    final castRaw = decoded['castHistory'] as List? ?? const [];
+    final telemetryRaw = decoded['telemetry'] as List? ?? const [];
+    final privacyRaw = decoded['privacy'] as Map<String, dynamic>?;
+
+    await ref.read(bookmarksProvider.notifier).importJson(bookmarksRaw);
+    await ref.read(historyProvider.notifier).importJson(historyRaw);
+    await ref.read(castHistoryProvider.notifier).importJson(castRaw);
+    await ref.read(telemetryProvider.notifier).importJson(telemetryRaw);
+
+    if (privacyRaw != null) {
+      final privacyNotifier = ref.read(privacySettingsProvider.notifier);
+      final bLimit = privacyRaw['bookmarksLimit'];
+      final hLimit = privacyRaw['historyLimit'];
+      final clearOnStart = privacyRaw['clearBrowsingDataOnStart'];
+      final telemetryEnabled = privacyRaw['telemetryEnabled'];
+      if (bLimit is int) await privacyNotifier.setBookmarksLimit(bLimit);
+      if (hLimit is int) await privacyNotifier.setHistoryLimit(hLimit);
+      if (clearOnStart is bool) {
+        await privacyNotifier.setClearBrowsingDataOnStart(clearOnStart);
+      }
+      if (telemetryEnabled is bool) {
+        await privacyNotifier.setTelemetryEnabled(telemetryEnabled);
+      }
+    }
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Backup imported successfully')),
+    );
+  }
+
+  Future<void> _resetAllLocalData() async {
+    await ref.read(bookmarksProvider.notifier).clear();
+    await ref.read(historyProvider.notifier).clear();
+    await ref.read(castHistoryProvider.notifier).clear();
+    await ref.read(telemetryProvider.notifier).clear();
+    await ref.read(privacySettingsProvider.notifier).setBookmarksLimit(500);
+    await ref.read(privacySettingsProvider.notifier).setHistoryLimit(500);
+    await ref
+        .read(privacySettingsProvider.notifier)
+        .setClearBrowsingDataOnStart(false);
+    await ref.read(privacySettingsProvider.notifier).setTelemetryEnabled(true);
+    await InAppWebViewController.clearAllCache();
+    await CookieManager.instance().deleteAllCookies();
+    await WebStorageManager.instance().deleteAllData();
+
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('All local app data reset')),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    final privacy = ref.watch(privacySettingsProvider);
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        20,
+        20,
+        20,
+        MediaQuery.of(context).viewInsets.bottom + 20,
+      ),
+      child: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text('Data and Privacy',
+                style: Theme.of(context).textTheme.titleLarge),
+            const SizedBox(height: 12),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Clear browsing data on app start'),
+              subtitle:
+                  const Text('Clears history, cookies, cache and web storage'),
+              value: privacy.clearBrowsingDataOnStart,
+              onChanged: (v) => ref
+                  .read(privacySettingsProvider.notifier)
+                  .setClearBrowsingDataOnStart(v),
+            ),
+            SwitchListTile(
+              contentPadding: EdgeInsets.zero,
+              title: const Text('Enable telemetry diagnostics'),
+              subtitle: const Text(
+                  'Stores local reliability events for troubleshooting'),
+              value: privacy.telemetryEnabled,
+              onChanged: (v) => ref
+                  .read(privacySettingsProvider.notifier)
+                  .setTelemetryEnabled(v),
+            ),
+            const Divider(),
+            Row(
+              children: [
+                Expanded(
+                  child: DropdownButtonFormField<int>(
+                    initialValue: privacy.bookmarksLimit,
+                    decoration: const InputDecoration(
+                      labelText: 'Bookmark retention',
+                      isDense: true,
+                    ),
+                    items: _limitOptions
+                        .map((v) => DropdownMenuItem(
+                              value: v,
+                              child: Text('$v items'),
+                            ))
+                        .toList(growable: false),
+                    onChanged: (v) async {
+                      if (v == null) return;
+                      await ref
+                          .read(privacySettingsProvider.notifier)
+                          .setBookmarksLimit(v);
+                      await ref.read(bookmarksProvider.notifier).applyLimit();
+                    },
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: DropdownButtonFormField<int>(
+                    initialValue: privacy.historyLimit,
+                    decoration: const InputDecoration(
+                      labelText: 'History retention',
+                      isDense: true,
+                    ),
+                    items: _limitOptions
+                        .map((v) => DropdownMenuItem(
+                              value: v,
+                              child: Text('$v items'),
+                            ))
+                        .toList(growable: false),
+                    onChanged: (v) async {
+                      if (v == null) return;
+                      await ref
+                          .read(privacySettingsProvider.notifier)
+                          .setHistoryLimit(v);
+                      await ref.read(historyProvider.notifier).applyLimit();
+                    },
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                FilledButton.icon(
+                  onPressed: _exportData,
+                  icon: const Icon(Icons.upload_file),
+                  label: const Text('Export backup'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _importData,
+                  icon: const Icon(Icons.download),
+                  label: const Text('Import backup'),
+                ),
+                OutlinedButton.icon(
+                  onPressed: _resetAllLocalData,
+                  style: OutlinedButton.styleFrom(foregroundColor: cs.error),
+                  icon: const Icon(Icons.delete_forever),
+                  label: const Text('Reset all local data'),
+                ),
+              ],
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TelemetrySheet extends ConsumerWidget {
+  const _TelemetrySheet();
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final events = ref.watch(telemetryProvider);
+    final cs = Theme.of(context).colorScheme;
+
+    return DraggableScrollableSheet(
+      expand: false,
+      initialChildSize: 0.7,
+      minChildSize: 0.3,
+      maxChildSize: 0.95,
+      builder: (_, scrollCtrl) {
+        return Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+              child: Row(
+                children: [
+                  Icon(Icons.analytics, color: cs.primary),
+                  const SizedBox(width: 8),
+                  Text('Telemetry',
+                      style: Theme.of(context)
+                          .textTheme
+                          .titleMedium
+                          ?.copyWith(fontWeight: FontWeight.w600)),
+                  const Spacer(),
+                  TextButton(
+                    onPressed: () =>
+                        ref.read(telemetryProvider.notifier).clear(),
+                    child: const Text('Clear'),
+                  ),
+                ],
+              ),
+            ),
+            const Divider(height: 1),
+            Expanded(
+              child: events.isEmpty
+                  ? Center(
+                      child: Text('No telemetry events yet',
+                          style: TextStyle(color: cs.onSurfaceVariant)),
+                    )
+                  : ListView.builder(
+                      controller: scrollCtrl,
+                      itemCount: events.length,
+                      itemBuilder: (_, i) {
+                        final e = events[i];
+                        return ListTile(
+                          dense: true,
+                          title: Text(e.name,
+                              style: const TextStyle(fontSize: 13),
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis),
+                          subtitle: Text(
+                            '${e.at.toIso8601String()}\n${jsonEncode(e.payload)}',
+                            style: TextStyle(
+                                fontSize: 11, color: cs.onSurfaceVariant),
+                          ),
+                          isThreeLine: true,
+                        );
+                      },
+                    ),
+            ),
+          ],
+        );
+      },
     );
   }
 }

@@ -4,10 +4,12 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/ad_blocker.dart';
 import '../providers/bookmarks_history.dart';
 import '../providers/app_state.dart';
+import '../providers/privacy_telemetry.dart';
 import '../models/dlna_device.dart';
 
 /// Callback when user taps "Cast" on a detected video URL.
@@ -35,7 +37,8 @@ const _bookmarks = [
 
 class _DetectedVideo {
   final String url;
-  final String type; // 'video', 'source', 'xhr', 'fetch', 'resource', 'embed', 'link', 'meta', etc.
+  final String
+      type; // 'video', 'source', 'xhr', 'fetch', 'resource', 'embed', 'link', 'meta', etc.
   const _DetectedVideo({required this.url, required this.type});
 
   /// Priority — lower is better. Direct streams > meta > embeds > links.
@@ -70,7 +73,10 @@ class _DetectedVideo {
           ? Uri.decodeComponent(uri.pathSegments.last.split('?').first)
           : '';
       // Strip extension
-      final name = last.replaceAll(RegExp(r'\.(m3u8|mpd|mp4|ts|webm|mkv|avi|mov|flv)$', caseSensitive: false), '');
+      final name = last.replaceAll(
+          RegExp(r'\.(m3u8|mpd|mp4|ts|webm|mkv|avi|mov|flv)$',
+              caseSensitive: false),
+          '');
       if (name.isNotEmpty && name.length < 60) return name;
     } catch (_) {}
     return '';
@@ -84,9 +90,15 @@ class _DetectedVideo {
       if (resolution.isEmpty && lower.contains('master')) return 'm3u8 (HLS)';
       return resolution.isNotEmpty ? 'm3u8 ($resolution)' : 'm3u8';
     }
-    if (lower.contains('.mpd')) return resolution.isNotEmpty ? 'mpd ($resolution)' : 'mpd (DASH)';
-    if (lower.contains('.mp4')) return resolution.isNotEmpty ? 'mp4 ($resolution)' : 'mp4';
-    if (lower.contains('.webm')) return resolution.isNotEmpty ? 'webm ($resolution)' : 'webm';
+    if (lower.contains('.mpd')) {
+      return resolution.isNotEmpty ? 'mpd ($resolution)' : 'mpd (DASH)';
+    }
+    if (lower.contains('.mp4')) {
+      return resolution.isNotEmpty ? 'mp4 ($resolution)' : 'mp4';
+    }
+    if (lower.contains('.webm')) {
+      return resolution.isNotEmpty ? 'webm ($resolution)' : 'webm';
+    }
     if (lower.contains('.mkv')) return 'mkv';
     if (lower.contains('.ts')) return 'ts';
     if (lower.contains('.flv')) return 'flv';
@@ -117,7 +129,8 @@ class _DetectedVideo {
   bool get isMasterPlaylist {
     final lower = url.toLowerCase();
     return lower.contains('.m3u8') &&
-        (lower.contains('master') || lower.contains('index') && !RegExp(r'v\d').hasMatch(lower));
+        (lower.contains('master') ||
+            lower.contains('index') && !RegExp(r'v\d').hasMatch(lower));
   }
 
   /// Extract the CDN/host domain for display.
@@ -161,7 +174,8 @@ const _kMaxTabs = 8;
 class BrowserScreen extends ConsumerStatefulWidget {
   final OnCastUrl onCastUrl;
   final ValueChanged<InAppWebViewController>? onControllerCreated;
-  const BrowserScreen({super.key, required this.onCastUrl, this.onControllerCreated});
+  const BrowserScreen(
+      {super.key, required this.onCastUrl, this.onControllerCreated});
 
   @override
   ConsumerState<BrowserScreen> createState() => _BrowserScreenState();
@@ -169,14 +183,16 @@ class BrowserScreen extends ConsumerStatefulWidget {
 
 class _BrowserScreenState extends ConsumerState<BrowserScreen>
     with AutomaticKeepAliveClientMixin {
+  static bool _startupPrivacyApplied = false;
+
   final _tabs = <_BrowserTab>[];
   int _activeTabIndex = 0;
   final _urlController = TextEditingController();
   final _urlFocus = FocusNode();
   bool _desktopMode = false;
+  bool? _adBlockAppliedValue;
 
-  static const _desktopUA =
-      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+  static const _desktopUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
       'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
 
   /// Content blocker rules built from AdBlocker.blockedDomains.
@@ -199,10 +215,31 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   @override
   void initState() {
     super.initState();
+    _adBlockAppliedValue = ref.read(settingsProvider).adBlockEnabled;
+    _applyStartupPrivacyPolicy();
     final tab = _createTab(url: 'https://www.google.com');
     _tabs.add(tab);
     _activeTabIndex = 0;
     _urlController.text = 'https://www.google.com';
+  }
+
+  Future<void> _applyStartupPrivacyPolicy() async {
+    if (_startupPrivacyApplied) return;
+    _startupPrivacyApplied = true;
+
+    final prefs = await SharedPreferences.getInstance();
+    final clearOnStart = prefs.getBool(kPrivacyClearOnStartKey) ?? false;
+    if (!clearOnStart) return;
+
+    try {
+      await InAppWebViewController.clearAllCache();
+      await CookieManager.instance().deleteAllCookies();
+      await WebStorageManager.instance().deleteAllData();
+      await ref.read(historyProvider.notifier).clear();
+      await ref.read(telemetryProvider.notifier).log(
+            'privacy_startup_clear_applied',
+          );
+    } catch (_) {}
   }
 
   // ── Content blocker builder ───────────────────────────────────────────────
@@ -211,11 +248,102 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     final blockers = <ContentBlocker>[];
     for (final domain in AdBlocker.blockedDomains) {
       blockers.add(ContentBlocker(
-        trigger: ContentBlockerTrigger(urlFilter: '.*${RegExp.escape(domain)}.*'),
+        trigger: ContentBlockerTrigger(
+          urlFilter: '^https?://([^/]+\\.)?${RegExp.escape(domain)}([/:].*)?',
+        ),
         action: ContentBlockerAction(type: ContentBlockerActionType.BLOCK),
       ));
     }
     return blockers;
+  }
+
+  List<UserScript> _initialScripts(bool adBlockEnabled) {
+    final scripts = <UserScript>[
+      UserScript(
+        source: AdBlocker.videoDetectorScript,
+        injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+      ),
+    ];
+
+    if (adBlockEnabled) {
+      scripts.insertAll(0, [
+        UserScript(
+          source: AdBlocker.earlyJsScript,
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+        UserScript(
+          source: _bridgeScript,
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+        UserScript(
+          source: _cssInjectionScript,
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+        ),
+        UserScript(
+          source: AdBlocker.jsScript,
+          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+        ),
+      ]);
+    }
+
+    return scripts;
+  }
+
+  static const _bridgeScript = r'''
+(function() {
+  if (window.NewTab) return;
+  window.NewTab = {
+    postMessage: function(url) {
+      try { window.flutter_inappwebview.callHandler('NewTab', url); } catch (_) {}
+    }
+  };
+})();
+''';
+
+  String get _cssInjectionScript {
+    final css = _escapeJsString(AdBlocker.cssRules);
+    return '''
+(function() {
+  if (window.__rlCssInjected) return;
+  window.__rlCssInjected = true;
+  var style = document.createElement('style');
+  style.setAttribute('data-rl-caster-adblock', '1');
+  style.textContent = $css;
+  (document.head || document.documentElement).appendChild(style);
+})();
+''';
+  }
+
+  Future<void> _injectAdBlockScripts(InAppWebViewController controller) async {
+    await controller.evaluateJavascript(source: _bridgeScript);
+    await controller.evaluateJavascript(source: _cssInjectionScript);
+    await controller.evaluateJavascript(source: AdBlocker.earlyJsScript);
+    await controller.evaluateJavascript(source: AdBlocker.jsScript);
+    await controller.evaluateJavascript(source: AdBlocker.videoDetectorScript);
+  }
+
+  Future<void> _applyAdBlockSettingsToTabs(bool enabled) async {
+    for (final tab in _tabs) {
+      final controller = tab.controller;
+      if (controller == null) continue;
+      await controller.setSettings(
+        settings: InAppWebViewSettings(
+          contentBlockers: enabled ? _contentBlockers : [],
+        ),
+      );
+      await controller.reload();
+    }
+  }
+
+  bool _shouldBlockNavigation(_BrowserTab tab, String url) {
+    final settings = ref.read(settingsProvider);
+    if (!settings.adBlockEnabled) return false;
+    final blocked =
+        AdBlocker.shouldBlock(url) || AdBlocker.isPopupOrRedirect(url);
+    if (blocked) {
+      _onAdBlocked(tab, url);
+    }
+    return blocked;
   }
 
   // ── Tab factory ───────────────────────────────────────────────────────────
@@ -231,15 +359,11 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   /// Builds an InAppWebView widget for a given tab.
   Widget _buildWebView(_BrowserTab tab) {
     final initialUrl = tab.url.isNotEmpty ? tab.url : 'https://www.google.com';
+    final adBlockEnabled = ref.read(settingsProvider).adBlockEnabled;
 
     return InAppWebView(
       initialUrlRequest: URLRequest(url: WebUri(initialUrl)),
-      initialUserScripts: UnmodifiableListView([
-        UserScript(
-          source: AdBlocker.videoDetectorScript,
-          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
-        ),
-      ]),
+      initialUserScripts: UnmodifiableListView(_initialScripts(adBlockEnabled)),
       initialSettings: InAppWebViewSettings(
         javaScriptEnabled: true,
         mediaPlaybackRequiresUserGesture: false,
@@ -247,7 +371,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         supportMultipleWindows: true,
         javaScriptCanOpenWindowsAutomatically: true,
         userAgent: _desktopMode ? _desktopUA : null,
-        contentBlockers: _contentBlockers,
+        contentBlockers: adBlockEnabled ? _contentBlockers : [],
       ),
       onWebViewCreated: (controller) {
         tab.controller = controller;
@@ -259,16 +383,32 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
             }
           },
         );
+        controller.addJavaScriptHandler(
+          handlerName: 'NewTab',
+          callback: (args) {
+            final url = args.isNotEmpty ? args.first?.toString() ?? '' : '';
+            if (url.isEmpty) return;
+            if (_shouldBlockNavigation(tab, url)) return;
+            _onNewTabRequested(url);
+          },
+        );
         if (_tabs.indexOf(tab) == _activeTabIndex) {
           widget.onControllerCreated?.call(controller);
         }
       },
       shouldOverrideUrlLoading: (controller, action) async {
+        final url = action.request.url?.toString() ?? '';
+        if (url.isNotEmpty && _shouldBlockNavigation(tab, url)) {
+          return NavigationActionPolicy.CANCEL;
+        }
         return NavigationActionPolicy.ALLOW;
       },
       onCreateWindow: (controller, createWindowAction) async {
         final url = createWindowAction.request.url?.toString() ?? '';
         if (url.isNotEmpty) {
+          if (_shouldBlockNavigation(tab, url)) {
+            return false;
+          }
           _onNewTabRequested(url);
         }
         return false; // we handle it ourselves
@@ -305,8 +445,14 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         if (_tabs.indexOf(tab) == _activeTabIndex) {
           _urlController.text = pageUrl;
         }
-        // Re-inject video detector (some SPAs clear scripts)
-        await controller.evaluateJavascript(source: AdBlocker.videoDetectorScript);
+        final settings = ref.read(settingsProvider);
+        if (settings.adBlockEnabled) {
+          await _injectAdBlockScripts(controller);
+        } else {
+          // Re-inject video detector even when ad blocking is disabled.
+          await controller.evaluateJavascript(
+              source: AdBlocker.videoDetectorScript);
+        }
         // Extract page thumbnail (og:image) for video list
         await controller.evaluateJavascript(source: '''
           (function() {
@@ -332,7 +478,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   void _addNewTab({String? url, bool switchTo = true}) {
     if (_tabs.length >= _kMaxTabs) {
       // Close oldest non-active tab to make room
-      final oldest = _tabs.indexWhere((t) => _tabs.indexOf(t) != _activeTabIndex);
+      final oldest =
+          _tabs.indexWhere((t) => _tabs.indexOf(t) != _activeTabIndex);
       if (oldest >= 0) _closeTab(oldest);
     }
 
@@ -407,11 +554,17 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     } catch (_) {}
   }
 
-  // ignore: unused_element — temporarily disabled ad blocker
   void _onAdBlocked(_BrowserTab tab, String url) {
     try {
       final host = Uri.tryParse(url)?.host ?? '';
       if (host.isEmpty) return;
+      ref.read(telemetryProvider.notifier).log(
+        'ad_navigation_blocked',
+        payload: {
+          'host': host,
+          'url': url,
+        },
+      );
       if (mounted) {
         setState(() {
           tab.lastBlockedDomain = host;
@@ -453,12 +606,12 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     setState(() => _desktopMode = !_desktopMode);
     final ua = _desktopMode ? _desktopUA : '';
     for (final tab in _tabs) {
-      tab.controller?.setSettings(settings: InAppWebViewSettings(userAgent: ua));
+      tab.controller
+          ?.setSettings(settings: InAppWebViewSettings(userAgent: ua));
     }
     _controller?.reload();
   }
 
-  // ignore: unused_element — temporarily disabled ad blocker
   static String _escapeJsString(String s) {
     final escaped = s
         .replaceAll('\\', '\\\\')
@@ -511,15 +664,21 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     final uri = Uri.tryParse(url);
     if (uri == null) return url;
     final host = uri.host.toLowerCase();
-    if (host.contains('youtube.com') || host.contains('youtu.be')) return 'YouTube video';
+    if (host.contains('youtube.com') || host.contains('youtu.be')) {
+      return 'YouTube video';
+    }
     if (host.contains('vimeo.com')) return 'Vimeo video';
-    if (host.contains('dailymotion.com') || host.contains('dai.ly')) return 'Dailymotion video';
+    if (host.contains('dailymotion.com') || host.contains('dai.ly')) {
+      return 'Dailymotion video';
+    }
     if (host.contains('twitch.tv')) return 'Twitch stream';
     if (host.contains('facebook.com')) return 'Facebook video';
     final last = uri.pathSegments.isNotEmpty
         ? Uri.decodeComponent(uri.pathSegments.last.split('?').first)
         : '';
-    if (last.length > 4) return last.length > 50 ? '${last.substring(0, 50)}…' : last;
+    if (last.length > 4) {
+      return last.length > 50 ? '${last.substring(0, 50)}…' : last;
+    }
     return host.isNotEmpty ? host : url;
   }
 
@@ -589,7 +748,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     // Also add current page URL if it's a platform URL and not already in list
     final items = <_DetectedVideo>[...sorted];
     if (_isPlatformUrl(_currentUrl) &&
-        !items.any((v) => _normalizeForCast(v.url) == _normalizeForCast(_currentUrl))) {
+        !items.any((v) =>
+            _normalizeForCast(v.url) == _normalizeForCast(_currentUrl))) {
       items.insert(0, _DetectedVideo(url: _currentUrl, type: 'page'));
     }
 
@@ -609,9 +769,9 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           },
           onDownload: (video) {
             ref.read(downloadServiceProvider).download(
-              url: video.url,
-              filename: _filenameFromUrl(video.url),
-            );
+                  url: video.url,
+                  filename: _filenameFromUrl(video.url),
+                );
             ScaffoldMessenger.of(ctx).showSnackBar(
               const SnackBar(
                 content: Text('Download started — check Files tab'),
@@ -637,6 +797,14 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     super.build(context);
     final cs = Theme.of(context).colorScheme;
     final hasCastable = _castableCount > 0;
+    final settings = ref.watch(settingsProvider);
+
+    if (_adBlockAppliedValue != settings.adBlockEnabled) {
+      _adBlockAppliedValue = settings.adBlockEnabled;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _applyAdBlockSettingsToTabs(settings.adBlockEnabled);
+      });
+    }
 
     return Scaffold(
       appBar: AppBar(
@@ -672,6 +840,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       ),
       body: Column(
         children: [
+          _buildAdBlockedBar(cs),
           // ── Tab strip (visible when 2+ tabs) ──
           if (_tabs.length > 1) _buildTabStrip(cs),
           if (_showBookmarks) _buildBookmarksGrid(cs),
@@ -702,7 +871,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
       height: 38,
       decoration: BoxDecoration(
         color: cs.surfaceContainerLow,
-        border: Border(bottom: BorderSide(color: cs.outlineVariant, width: 0.5)),
+        border:
+            Border(bottom: BorderSide(color: cs.outlineVariant, width: 0.5)),
       ),
       child: Row(
         children: [
@@ -718,7 +888,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                   onTap: () => _switchToTab(i),
                   child: AnimatedContainer(
                     duration: const Duration(milliseconds: 150),
-                    constraints: const BoxConstraints(maxWidth: 160, minWidth: 60),
+                    constraints:
+                        const BoxConstraints(maxWidth: 160, minWidth: 60),
                     margin: const EdgeInsets.only(right: 4),
                     padding: const EdgeInsets.symmetric(horizontal: 10),
                     decoration: BoxDecoration(
@@ -727,7 +898,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                           : cs.surfaceContainerHighest,
                       borderRadius: BorderRadius.circular(8),
                       border: isActive
-                          ? Border.all(color: cs.primary.withAlpha(80), width: 1)
+                          ? Border.all(
+                              color: cs.primary.withAlpha(80), width: 1)
                           : null,
                     ),
                     child: Row(
@@ -749,8 +921,9 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                             overflow: TextOverflow.ellipsis,
                             style: TextStyle(
                               fontSize: 11,
-                              fontWeight:
-                                  isActive ? FontWeight.w600 : FontWeight.normal,
+                              fontWeight: isActive
+                                  ? FontWeight.w600
+                                  : FontWeight.normal,
                               color: isActive
                                   ? cs.onPrimaryContainer
                                   : cs.onSurfaceVariant,
@@ -820,6 +993,10 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                         color: cs.onSurfaceVariant)),
                 const Spacer(),
                 TextButton(
+                  onPressed: _showBookmarksSheet,
+                  child: const Text('View all', style: TextStyle(fontSize: 10)),
+                ),
+                TextButton(
                   onPressed: () => ref.read(bookmarksProvider.notifier).clear(),
                   child: const Text('Clear', style: TextStyle(fontSize: 10)),
                 ),
@@ -834,11 +1011,14 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                   avatar: const Icon(Icons.bookmark, size: 14),
                   label: Text(
                     b.title.isNotEmpty
-                        ? (b.title.length > 15 ? '${b.title.substring(0, 15)}…' : b.title)
+                        ? (b.title.length > 15
+                            ? '${b.title.substring(0, 15)}…'
+                            : b.title)
                         : host,
                     style: const TextStyle(fontSize: 11),
                   ),
-                  onPressed: () => _controller?.loadUrl(urlRequest: URLRequest(url: WebUri(b.url))),
+                  onPressed: () => _controller?.loadUrl(
+                      urlRequest: URLRequest(url: WebUri(b.url))),
                 );
               }).toList(),
             ),
@@ -851,8 +1031,10 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
             children: _bookmarks
                 .map((b) => ActionChip(
                       avatar: Icon(b.icon, size: 16),
-                      label: Text(b.label, style: const TextStyle(fontSize: 12)),
-                      onPressed: () => _controller?.loadUrl(urlRequest: URLRequest(url: WebUri(b.url))),
+                      label:
+                          Text(b.label, style: const TextStyle(fontSize: 12)),
+                      onPressed: () => _controller?.loadUrl(
+                          urlRequest: URLRequest(url: WebUri(b.url))),
                     ))
                 .toList(),
           ),
@@ -891,9 +1073,10 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   }
 
   Widget _buildNavRow(ColorScheme cs) {
-    final bookmarks = ref.watch(bookmarksProvider);
-    final isBookmarked = _currentUrl.isNotEmpty &&
-        bookmarks.any((b) => b.url == _currentUrl);
+    final bookmarksNotifier = ref.read(bookmarksProvider.notifier);
+    final settings = ref.watch(settingsProvider);
+    final isBookmarked =
+        _currentUrl.isNotEmpty && bookmarksNotifier.isBookmarked(_currentUrl);
 
     return SafeArea(
       child: Padding(
@@ -916,15 +1099,33 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
               tooltip: 'Home',
               onPressed: () {
                 setState(() => _showBookmarks = true);
-                _controller?.loadUrl(urlRequest: URLRequest(url: WebUri('https://www.google.com')));
+                _controller?.loadUrl(
+                    urlRequest:
+                        URLRequest(url: WebUri('https://www.google.com')));
               },
             ),
             // ── Tab counter ──
             _TabCountButton(
               count: _tabs.length,
-              onTap: _tabs.length > 1
-                  ? _showTabOverview
-                  : () => _addNewTab(),
+              onTap: _tabs.length > 1 ? _showTabOverview : () => _addNewTab(),
+            ),
+            IconButton(
+              icon: Icon(
+                settings.adBlockEnabled ? Icons.shield : Icons.shield_outlined,
+                size: 20,
+                color: settings.adBlockEnabled ? cs.primary : null,
+              ),
+              tooltip: settings.adBlockEnabled
+                  ? 'Ad blocker: on'
+                  : 'Ad blocker: off',
+              onPressed: () {
+                final enabled = !settings.adBlockEnabled;
+                ref.read(settingsProvider.notifier).toggleAdBlock();
+                ref.read(telemetryProvider.notifier).log(
+                  'adblock_toggled',
+                  payload: {'enabled': enabled},
+                );
+              },
             ),
             IconButton(
               icon: Icon(
@@ -951,6 +1152,11 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
               onPressed: _showHistorySheet,
             ),
             IconButton(
+              icon: const Icon(Icons.cleaning_services_outlined, size: 20),
+              tooltip: 'Clear browsing data',
+              onPressed: _confirmAndClearBrowsingData,
+            ),
+            IconButton(
               icon: Icon(
                 _desktopMode ? Icons.desktop_windows : Icons.phone_android,
                 size: 20,
@@ -969,6 +1175,155 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         ),
       ),
     );
+  }
+
+  void _showBookmarksSheet() {
+    final cs = Theme.of(context).colorScheme;
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return Consumer(
+          builder: (_, ref, __) {
+            final bookmarks = ref.watch(bookmarksProvider);
+            return DraggableScrollableSheet(
+              expand: false,
+              initialChildSize: 0.6,
+              minChildSize: 0.3,
+              maxChildSize: 0.9,
+              builder: (_, scrollCtrl) {
+                return Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                      child: Row(
+                        children: [
+                          Icon(Icons.bookmark, color: cs.primary, size: 22),
+                          const SizedBox(width: 8),
+                          Text('Bookmarks',
+                              style: Theme.of(ctx)
+                                  .textTheme
+                                  .titleMedium
+                                  ?.copyWith(fontWeight: FontWeight.w600)),
+                          const Spacer(),
+                          TextButton(
+                            onPressed: () =>
+                                ref.read(bookmarksProvider.notifier).clear(),
+                            child: const Text('Clear all',
+                                style: TextStyle(fontSize: 12)),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const Divider(height: 1),
+                    Expanded(
+                      child: bookmarks.isEmpty
+                          ? Center(
+                              child: Text('No bookmarks yet',
+                                  style: TextStyle(color: cs.onSurfaceVariant)))
+                          : ListView.builder(
+                              controller: scrollCtrl,
+                              itemCount: bookmarks.length,
+                              itemBuilder: (_, i) {
+                                final entry = bookmarks[i];
+                                return ListTile(
+                                  dense: true,
+                                  leading: const Icon(Icons.bookmark, size: 18),
+                                  title: Text(
+                                      entry.title.isNotEmpty
+                                          ? entry.title
+                                          : entry.url,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(fontSize: 13)),
+                                  subtitle: Text(entry.url,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: TextStyle(
+                                          fontSize: 11,
+                                          color: cs.onSurfaceVariant)),
+                                  onTap: () {
+                                    Navigator.pop(ctx);
+                                    _controller?.loadUrl(
+                                        urlRequest:
+                                            URLRequest(url: WebUri(entry.url)));
+                                  },
+                                  trailing: IconButton(
+                                    icon: const Icon(Icons.close, size: 16),
+                                    onPressed: () {
+                                      ref
+                                          .read(bookmarksProvider.notifier)
+                                          .remove(entry.url);
+                                    },
+                                  ),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                );
+              },
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Future<void> _confirmAndClearBrowsingData() async {
+    final confirmed = await showDialog<bool>(
+          context: context,
+          builder: (ctx) => AlertDialog(
+            title: const Text('Clear browsing data?'),
+            content: const Text(
+              'This will clear browser cache, cookies, and web storage for all tabs.',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                child: const Text('Cancel'),
+              ),
+              FilledButton(
+                onPressed: () => Navigator.pop(ctx, true),
+                child: const Text('Clear'),
+              ),
+            ],
+          ),
+        ) ??
+        false;
+
+    if (!confirmed) return;
+    await _clearBrowsingData();
+  }
+
+  Future<void> _clearBrowsingData() async {
+    try {
+      await InAppWebViewController.clearAllCache();
+      await CookieManager.instance().deleteAllCookies();
+      await WebStorageManager.instance().deleteAllData();
+      await ref.read(telemetryProvider.notifier).log(
+            'privacy_clear_browsing_data',
+          );
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Browsing data cleared'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    } catch (_) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not clear all browsing data'),
+          duration: Duration(seconds: 2),
+        ),
+      );
+    }
   }
 
   void _showTabOverview() {
@@ -1051,8 +1406,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                         tab.url.isNotEmpty ? tab.url : 'about:blank',
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: TextStyle(
-                            fontSize: 10, color: cs.onSurfaceVariant),
+                        style:
+                            TextStyle(fontSize: 10, color: cs.onSurfaceVariant),
                       ),
                       trailing: _tabs.length > 1
                           ? IconButton(
@@ -1108,15 +1463,18 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                       Icon(Icons.history, color: cs.primary, size: 22),
                       const SizedBox(width: 8),
                       Text('Browsing History',
-                          style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
-                              fontWeight: FontWeight.w600)),
+                          style: Theme.of(ctx)
+                              .textTheme
+                              .titleMedium
+                              ?.copyWith(fontWeight: FontWeight.w600)),
                       const Spacer(),
                       TextButton(
                         onPressed: () {
                           ref.read(historyProvider.notifier).clear();
                           Navigator.pop(ctx);
                         },
-                        child: const Text('Clear all', style: TextStyle(fontSize: 12)),
+                        child: const Text('Clear all',
+                            style: TextStyle(fontSize: 12)),
                       ),
                     ],
                   ),
@@ -1135,7 +1493,10 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                             return ListTile(
                               dense: true,
                               leading: const Icon(Icons.language, size: 18),
-                              title: Text(entry.title.isNotEmpty ? entry.title : entry.url,
+                              title: Text(
+                                  entry.title.isNotEmpty
+                                      ? entry.title
+                                      : entry.url,
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: const TextStyle(fontSize: 13)),
@@ -1143,15 +1504,20 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                                   maxLines: 1,
                                   overflow: TextOverflow.ellipsis,
                                   style: TextStyle(
-                                      fontSize: 11, color: cs.onSurfaceVariant)),
+                                      fontSize: 11,
+                                      color: cs.onSurfaceVariant)),
                               onTap: () {
                                 Navigator.pop(ctx);
-                                _controller?.loadUrl(urlRequest: URLRequest(url: WebUri(entry.url)));
+                                _controller?.loadUrl(
+                                    urlRequest:
+                                        URLRequest(url: WebUri(entry.url)));
                               },
                               trailing: IconButton(
                                 icon: const Icon(Icons.close, size: 16),
                                 onPressed: () {
-                                  ref.read(historyProvider.notifier).removeEntry(entry.url);
+                                  ref
+                                      .read(historyProvider.notifier)
+                                      .removeEntry(entry.url);
                                 },
                               ),
                             );
@@ -1185,7 +1551,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
             children: [
               Center(
                 child: Container(
-                  width: 40, height: 4,
+                  width: 40,
+                  height: 4,
                   margin: const EdgeInsets.only(bottom: 12),
                   decoration: BoxDecoration(
                     color: cs.onSurfaceVariant.withAlpha(80),
@@ -1198,28 +1565,33 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                   Icon(Icons.download, color: cs.primary),
                   const SizedBox(width: 8),
                   Text('Download Video',
-                      style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
-                          fontWeight: FontWeight.w600)),
+                      style: Theme.of(ctx)
+                          .textTheme
+                          .titleMedium
+                          ?.copyWith(fontWeight: FontWeight.w600)),
                 ],
               ),
               const SizedBox(height: 8),
               ...sorted.take(10).map((v) => ListTile(
                     contentPadding: EdgeInsets.zero,
                     dense: true,
-                    leading: Icon(_typeIcon(v.type), color: cs.primary, size: 20),
+                    leading:
+                        Icon(_typeIcon(v.type), color: cs.primary, size: 20),
                     title: Text(_videoLabel(v.url),
-                        maxLines: 1, overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
                         style: const TextStyle(fontSize: 13)),
                     subtitle: Text(_typeLabel(v.type),
-                        style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant)),
+                        style: TextStyle(
+                            fontSize: 11, color: cs.onSurfaceVariant)),
                     trailing: IconButton(
                       icon: Icon(Icons.download, color: cs.primary),
                       onPressed: () {
                         Navigator.pop(ctx);
                         ref.read(downloadServiceProvider).download(
-                          url: v.url,
-                          filename: _filenameFromUrl(v.url),
-                        );
+                              url: v.url,
+                              filename: _filenameFromUrl(v.url),
+                            );
                         ScaffoldMessenger.of(context).showSnackBar(
                           const SnackBar(
                             content: Text('Download started — check Files tab'),
@@ -1236,7 +1608,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     );
   }
 
-  // ignore: unused_element — temporarily disabled ad blocker
   Widget _buildAdBlockedBar(ColorScheme cs) {
     final domain = _activeTab.lastBlockedDomain;
     if (domain == null) return const SizedBox.shrink();
@@ -1279,7 +1650,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   String _filenameFromUrl(String url) {
     try {
       final uri = Uri.parse(url);
-      final last = uri.pathSegments.isNotEmpty ? uri.pathSegments.last : 'video';
+      final last =
+          uri.pathSegments.isNotEmpty ? uri.pathSegments.last : 'video';
       final name = Uri.decodeComponent(last.split('?').first);
       if (name.contains('.')) return name;
       return '$name.mp4';
@@ -1369,7 +1741,8 @@ class _AnimatedCastButtonState extends State<_AnimatedCastButton>
           backgroundColor: cs.error,
           child: IconButton(
             icon: Icon(Icons.cast, color: cs.primary, size: 24),
-            tooltip: '${widget.count} video${widget.count == 1 ? '' : 's'} — tap to cast',
+            tooltip:
+                '${widget.count} video${widget.count == 1 ? '' : 's'} — tap to cast',
             onPressed: widget.onTap,
           ),
         ),
@@ -1443,8 +1816,10 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   SizedBox(
-                    width: 18, height: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: cs.primary),
+                    width: 18,
+                    height: 18,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: cs.primary),
                   ),
                   const SizedBox(width: 10),
                   Text('Starting stream…',
@@ -1466,7 +1841,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                   ),
                   TextButton(
                     onPressed: () => ref.read(castProvider.notifier).stop(),
-                    child: const Text('Dismiss', style: TextStyle(fontSize: 11)),
+                    child:
+                        const Text('Dismiss', style: TextStyle(fontSize: 11)),
                   ),
                 ],
               ),
@@ -1486,12 +1862,15 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
                   SizedBox(
-                    width: 16, height: 16,
-                    child: CircularProgressIndicator(strokeWidth: 2, color: cs.primary),
+                    width: 16,
+                    height: 16,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: cs.primary),
                   ),
                   const SizedBox(width: 8),
                   Text('Extracting video…',
-                      style: TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
+                      style:
+                          TextStyle(fontSize: 12, color: cs.onSurfaceVariant)),
                 ],
               ),
             ),
@@ -1530,8 +1909,11 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
     }
 
     // Auto-select last used device
-    if (selectedDevice == null && lastDeviceLocation != null && devices.isNotEmpty) {
-      final match = devices.where((d) => d.location == lastDeviceLocation).firstOrNull;
+    if (selectedDevice == null &&
+        lastDeviceLocation != null &&
+        devices.isNotEmpty) {
+      final match =
+          devices.where((d) => d.location == lastDeviceLocation).firstOrNull;
       if (match != null) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
           ref.read(selectedDeviceProvider.notifier).state = match;
@@ -1562,7 +1944,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                   videoState.info.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 12),
+                  style: const TextStyle(
+                      fontWeight: FontWeight.w600, fontSize: 12),
                 ),
               ),
               // Close panel / dismiss video
@@ -1584,7 +1967,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                   borderRadius: BorderRadius.circular(8),
                   onTap: () => _showDevicePicker(cs, devices, isScanning),
                   child: Container(
-                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                     decoration: BoxDecoration(
                       border: Border.all(color: cs.outlineVariant),
                       borderRadius: BorderRadius.circular(8),
@@ -1608,7 +1992,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                         ),
                         if (isScanning)
                           SizedBox(
-                            width: 12, height: 12,
+                            width: 12,
+                            height: 12,
                             child: CircularProgressIndicator(
                                 strokeWidth: 1.5, color: cs.primary),
                           )
@@ -1626,25 +2011,29 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                 icon: const Icon(Icons.cast, size: 18),
                 label: const Text('Cast'),
                 style: FilledButton.styleFrom(
-                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                  textStyle: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                  padding:
+                      const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                  textStyle: const TextStyle(
+                      fontSize: 13, fontWeight: FontWeight.w600),
                 ),
                 onPressed: selectedDevice != null && selectedFormat != null
                     ? () {
                         ref.read(castHistoryProvider.notifier).add(
-                          videoState.sourceUrl,
-                          videoState.info.title,
-                          videoState.info.thumbnailUrl,
-                        );
-                        ref.read(lastDeviceProvider.notifier).save(selectedDevice.location);
+                              videoState.sourceUrl,
+                              videoState.info.title,
+                              videoState.info.thumbnailUrl,
+                            );
+                        ref
+                            .read(lastDeviceProvider.notifier)
+                            .save(selectedDevice.location);
                         ref.read(castProvider.notifier).cast(
-                          device: selectedDevice,
-                          format: selectedFormat,
-                          title: videoState.info.title,
-                          routeThroughPhone: settings.routeThroughPhone,
-                          durationSeconds: videoState.info.durationSeconds,
-                          refererUrl: ref.read(browserPageUrlProvider),
-                        );
+                              device: selectedDevice,
+                              format: selectedFormat,
+                              title: videoState.info.title,
+                              routeThroughPhone: settings.routeThroughPhone,
+                              durationSeconds: videoState.info.durationSeconds,
+                              refererUrl: ref.read(browserPageUrlProvider),
+                            );
                       }
                     : null,
               ),
@@ -1671,7 +2060,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
             children: [
               Center(
                 child: Container(
-                  width: 40, height: 4,
+                  width: 40,
+                  height: 4,
                   margin: const EdgeInsets.only(bottom: 12),
                   decoration: BoxDecoration(
                     color: cs.onSurfaceVariant.withAlpha(80),
@@ -1684,18 +2074,22 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                   Icon(Icons.tv, color: cs.primary, size: 20),
                   const SizedBox(width: 8),
                   Text('Select TV',
-                      style: Theme.of(ctx).textTheme.titleMedium?.copyWith(
-                          fontWeight: FontWeight.w600)),
+                      style: Theme.of(ctx)
+                          .textTheme
+                          .titleMedium
+                          ?.copyWith(fontWeight: FontWeight.w600)),
                   const Spacer(),
                   if (isScanning)
                     const SizedBox(
-                      width: 14, height: 14,
+                      width: 14,
+                      height: 14,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   else
                     TextButton.icon(
                       icon: const Icon(Icons.refresh, size: 14),
-                      label: const Text('Rescan', style: TextStyle(fontSize: 12)),
+                      label:
+                          const Text('Rescan', style: TextStyle(fontSize: 12)),
                       onPressed: () {
                         ref.read(devicesProvider.notifier).scan();
                         Navigator.pop(ctx);
@@ -1727,9 +2121,11 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                   title: Text(d.name,
                       style: TextStyle(
                           fontSize: 14,
-                          fontWeight: sel ? FontWeight.w600 : FontWeight.normal)),
+                          fontWeight:
+                              sel ? FontWeight.w600 : FontWeight.normal)),
                   subtitle: d.manufacturer.isNotEmpty
-                      ? Text(d.manufacturer, style: const TextStyle(fontSize: 11))
+                      ? Text(d.manufacturer,
+                          style: const TextStyle(fontSize: 11))
                       : null,
                   trailing: sel
                       ? Icon(Icons.check_circle, color: cs.primary, size: 18)
@@ -1760,7 +2156,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
           if (castState.device.protocol == CastProtocol.chromecast) {
             if (mounted) setState(() => _volume ??= 50);
           } else {
-            final v = await ref.read(dlnaServiceProvider).getVolume(castState.device);
+            final v =
+                await ref.read(dlnaServiceProvider).getVolume(castState.device);
             if (mounted && v != null) setState(() => _volume = v.toDouble());
           }
         } catch (_) {}
@@ -1787,7 +2184,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                         style: const TextStyle(
                             fontWeight: FontWeight.w600, fontSize: 12)),
                     Text('on ${castState.device.name}',
-                        style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
+                        style: TextStyle(
+                            fontSize: 10, color: cs.onSurfaceVariant)),
                   ],
                 ),
               ),
@@ -1816,8 +2214,9 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                 min: 0,
                 max: total.toDouble(),
                 onChanged: (_) {},
-                onChangeEnd: (v) =>
-                    ref.read(castProvider.notifier).seek(Duration(seconds: v.toInt())),
+                onChangeEnd: (v) => ref
+                    .read(castProvider.notifier)
+                    .seek(Duration(seconds: v.toInt())),
               ),
             ),
             Padding(
@@ -1826,9 +2225,11 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
                   Text(_fmt(progress.position),
-                      style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
+                      style:
+                          TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
                   Text(_fmt(progress.total),
-                      style: TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
+                      style:
+                          TextStyle(fontSize: 10, color: cs.onSurfaceVariant)),
                 ],
               ),
             ),
@@ -1845,7 +2246,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                 tooltip: 'Rewind 10s',
                 onPressed: () {
                   final newPos = Duration(
-                      seconds: (progress.position.inSeconds - 10).clamp(0, total));
+                      seconds:
+                          (progress.position.inSeconds - 10).clamp(0, total));
                   ref.read(castProvider.notifier).seek(newPos);
                 },
               ),
@@ -1865,7 +2267,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                 tooltip: 'Forward 10s',
                 onPressed: () {
                   final newPos = Duration(
-                      seconds: (progress.position.inSeconds + 10).clamp(0, total));
+                      seconds:
+                          (progress.position.inSeconds + 10).clamp(0, total));
                   ref.read(castProvider.notifier).seek(newPos);
                 },
               ),
@@ -1909,11 +2312,15 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                       onChanged: (v) => setState(() => _volume = v),
                       onChangeEnd: (v) async {
                         setState(() => _volume = v);
-                        if (castState.device.protocol == CastProtocol.chromecast) {
-                          await ref.read(chromecastServiceProvider).setVolume(v / 100);
+                        if (castState.device.protocol ==
+                            CastProtocol.chromecast) {
+                          await ref
+                              .read(chromecastServiceProvider)
+                              .setVolume(v / 100);
                         } else {
-                          await ref.read(dlnaServiceProvider).setVolume(
-                              castState.device, v.round());
+                          await ref
+                              .read(dlnaServiceProvider)
+                              .setVolume(castState.device, v.round());
                         }
                       },
                     ),
@@ -2015,10 +2422,12 @@ class _VideoListScreenState extends State<_VideoListScreen> {
                 widget.onToggleRoute();
               },
               child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
                 child: Row(
                   children: [
-                    Icon(Icons.phone_android, size: 20, color: cs.onSurfaceVariant),
+                    Icon(Icons.phone_android,
+                        size: 20, color: cs.onSurfaceVariant),
                     const SizedBox(width: 12),
                     Expanded(
                       child: Text(
@@ -2027,11 +2436,13 @@ class _VideoListScreenState extends State<_VideoListScreen> {
                       ),
                     ),
                     SizedBox(
-                      width: 24, height: 24,
+                      width: 24,
+                      height: 24,
                       child: Checkbox(
                         value: _routeThroughPhone,
                         onChanged: (_) {
-                          setState(() => _routeThroughPhone = !_routeThroughPhone);
+                          setState(
+                              () => _routeThroughPhone = !_routeThroughPhone);
                           widget.onToggleRoute();
                         },
                         materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -2050,16 +2461,20 @@ class _VideoListScreenState extends State<_VideoListScreen> {
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(Icons.videocam_off, size: 48, color: cs.onSurfaceVariant.withAlpha(100)),
+                        Icon(Icons.videocam_off,
+                            size: 48,
+                            color: cs.onSurfaceVariant.withAlpha(100)),
                         const SizedBox(height: 12),
                         Text('No videos detected',
-                            style: tt.bodyLarge?.copyWith(color: cs.onSurfaceVariant)),
+                            style: tt.bodyLarge
+                                ?.copyWith(color: cs.onSurfaceVariant)),
                       ],
                     ),
                   )
                 : ListView.separated(
                     itemCount: widget.items.length,
-                    separatorBuilder: (_, __) => const Divider(height: 1, indent: 80),
+                    separatorBuilder: (_, __) =>
+                        const Divider(height: 1, indent: 80),
                     itemBuilder: (ctx, i) {
                       final video = widget.items[i];
                       return _VideoListTile(
@@ -2176,9 +2591,11 @@ class _VideoListTile extends StatelessWidget {
                             ),
                           ),
                         ),
-                      if (video.streamLabel.isNotEmpty) const SizedBox(width: 8),
+                      if (video.streamLabel.isNotEmpty)
+                        const SizedBox(width: 8),
                       Container(
-                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 6, vertical: 2),
                         decoration: BoxDecoration(
                           color: const Color(0xFF2E7D32),
                           borderRadius: BorderRadius.circular(4),

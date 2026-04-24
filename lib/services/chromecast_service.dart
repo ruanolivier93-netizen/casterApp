@@ -35,7 +35,8 @@ class ChromecastService {
   // ── Discovery ───────────────────────────────────────────────────────────
 
   /// Discovers Chromecast devices via mDNS.
-  Stream<DlnaDevice> discover({Duration timeout = const Duration(seconds: 5)}) async* {
+  Stream<DlnaDevice> discover(
+      {Duration timeout = const Duration(seconds: 5)}) async* {
     final seen = <String>{};
     final client = MDnsClient();
     try {
@@ -73,7 +74,8 @@ class ChromecastService {
         await for (final txt in client.lookup<TxtResourceRecord>(
           ResourceRecordQuery.text(ptr.domainName),
         )) {
-          final fnEntry = txt.text.split('\n').where((l) => l.startsWith('fn='));
+          final fnEntry =
+              txt.text.split('\n').where((l) => l.startsWith('fn='));
           if (fnEntry.isNotEmpty) {
             friendlyName = fnEntry.first.substring(3);
           }
@@ -252,12 +254,46 @@ class ChromecastService {
   }
 
   Future<void> seek(Duration position) async {
-    if (_transportId == null || _mediaSessionId == null) return;
-    await _sendRequest(_nsMedia, _transportId!, {
+    if (_transportId == null) return;
+    await _ensureMediaSession();
+    if (_mediaSessionId == null) return;
+
+    final payload = {
       'type': 'SEEK',
       'mediaSessionId': _mediaSessionId,
       'currentTime': position.inMilliseconds / 1000.0,
-    });
+      // Ensures receiver keeps playback active after seek when possible.
+      'resumeState': 'PLAYBACK_START',
+    };
+
+    try {
+      await _sendRequest(_nsMedia, _transportId!, payload);
+    } catch (_) {
+      // Some receivers rotate mediaSessionId after buffering/seek boundaries.
+      // Refresh and retry once before bubbling the error up.
+      await _ensureMediaSession(forceRefresh: true);
+      if (_mediaSessionId == null) rethrow;
+      await _sendRequest(_nsMedia, _transportId!, {
+        ...payload,
+        'mediaSessionId': _mediaSessionId,
+      });
+    }
+  }
+
+  Future<void> _ensureMediaSession({bool forceRefresh = false}) async {
+    if (!forceRefresh && _mediaSessionId != null) return;
+    if (_transportId == null) return;
+    try {
+      final resp = await _sendRequest(_nsMedia, _transportId!, {
+        'type': 'GET_STATUS',
+      });
+      final statuses = resp['status'] as List?;
+      if (statuses != null && statuses.isNotEmpty) {
+        _mediaSessionId = statuses[0]['mediaSessionId'] as int?;
+      }
+    } catch (_) {
+      // Keep existing session state if status refresh fails.
+    }
   }
 
   Future<void> setVolume(double level) async {
@@ -268,16 +304,30 @@ class ChromecastService {
   }
 
   /// Returns (position, duration, playerState) or null if unavailable.
-  Future<({Duration position, Duration duration, String state})?> getMediaStatus() async {
-    if (_transportId == null || _mediaSessionId == null) return null;
+  Future<({Duration position, Duration duration, String state})?>
+      getMediaStatus() async {
+    if (_transportId == null) return null;
+    // Auto-recover stale media sessions (receiver rotates the id after seek
+    // boundaries, ad insertions, segment gaps, etc.).
+    if (_mediaSessionId == null) {
+      await _ensureMediaSession(forceRefresh: true);
+      if (_mediaSessionId == null) return null;
+    }
     try {
       final resp = await _sendRequest(_nsMedia, _transportId!, {
         'type': 'GET_STATUS',
         'mediaSessionId': _mediaSessionId,
       });
       final statuses = resp['status'] as List?;
-      if (statuses == null || statuses.isEmpty) return null;
+      if (statuses == null || statuses.isEmpty) {
+        // Empty status often means the session id is stale — refresh once.
+        await _ensureMediaSession(forceRefresh: true);
+        return null;
+      }
       final s = statuses[0] as Map<String, dynamic>;
+      // Keep our session id in sync if the receiver swapped it.
+      final reportedId = s['mediaSessionId'] as int?;
+      if (reportedId != null) _mediaSessionId = reportedId;
       final pos = (s['currentTime'] as num?)?.toDouble() ?? 0;
       final dur = (s['media']?['duration'] as num?)?.toDouble() ?? 0;
       final state = s['playerState'] as String? ?? 'UNKNOWN';
@@ -287,6 +337,8 @@ class ChromecastService {
         state: state,
       );
     } catch (_) {
+      // On failure, mark session for refresh on next call.
+      _mediaSessionId = null;
       return null;
     }
   }
