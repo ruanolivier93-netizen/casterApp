@@ -1160,22 +1160,27 @@ audio *,
     } catch(_) { return true; }
   }
 
-  /* ══ Capture-phase click guard ══ */
+  /* ══ Capture-phase click guard.
+   *    PERFORMANCE: getComputedStyle on every click target is expensive on
+   *    interaction-heavy sites, so we skip the opacity check on video hosts
+   *    and only do the cheap href/target inspection there. ══ */
   document.addEventListener('click', function(e) {
     var t = e.target;
     if (!t) return;
-    /* Block clicks on invisible overlays */
-    try {
-      var s = getComputedStyle(t);
-      if (parseFloat(s.opacity) < 0.1 &&
-          t.tagName !== 'VIDEO' && t.tagName !== 'INPUT' &&
-          t.tagName !== 'BUTTON' && t.tagName !== 'SELECT' &&
-          t.tagName !== 'TEXTAREA') {
-        e.preventDefault();
-        e.stopImmediatePropagation();
-        return;
-      }
-    } catch(_) {}
+    /* Block clicks on invisible overlays (skip on video hosts for perf). */
+    if (!window.__rlIsVideoHost) {
+      try {
+        var s = getComputedStyle(t);
+        if (parseFloat(s.opacity) < 0.1 &&
+            t.tagName !== 'VIDEO' && t.tagName !== 'INPUT' &&
+            t.tagName !== 'BUTTON' && t.tagName !== 'SELECT' &&
+            t.tagName !== 'TEXTAREA') {
+          e.preventDefault();
+          e.stopImmediatePropagation();
+          return;
+        }
+      } catch(_) {}
+    }
     /* Handle links — open target=_blank in new tab, block ad links */
     var anchor = t.closest ? t.closest('a') : null;
     if (anchor && anchor.href) {
@@ -1193,24 +1198,27 @@ audio *,
     }
   }, true);
 
-  /* ══ Mousedown/pointerdown guard — block ad opens on press ══ */
-  ['mousedown', 'pointerdown', 'mouseup', 'pointerup', 'auxclick'].forEach(function(evt) {
-    document.addEventListener(evt, function(e) {
-      var t = e.target;
-      if (!t) return;
-      /* If click target is an invisible/transparent overlay, block it */
-      try {
-        var s = getComputedStyle(t);
-        if (parseFloat(s.opacity) < 0.1 &&
-            t.tagName !== 'VIDEO' && t.tagName !== 'INPUT' &&
-            t.tagName !== 'BUTTON' && t.tagName !== 'SELECT') {
-          e.preventDefault();
-          e.stopImmediatePropagation();
-          return;
-        }
-      } catch(_) {}
-    }, true);
-  });
+  /* ══ Mousedown/pointerdown guard — block ad opens on press.
+   *    Skipped entirely on video hosts (where it interferes with player
+   *    drag-to-seek and full-screen toggling, plus costs perf). ══ */
+  if (!window.__rlIsVideoHost) {
+    ['mousedown', 'pointerdown'].forEach(function(evt) {
+      document.addEventListener(evt, function(e) {
+        var t = e.target;
+        if (!t) return;
+        try {
+          var s = getComputedStyle(t);
+          if (parseFloat(s.opacity) < 0.1 &&
+              t.tagName !== 'VIDEO' && t.tagName !== 'INPUT' &&
+              t.tagName !== 'BUTTON' && t.tagName !== 'SELECT') {
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            return;
+          }
+        } catch(_) {}
+      }, true);
+    });
+  }
 
   /* ══ Strip document/body click listeners that look like popunders.
    *    SOFTENED: requires both a redirect-like call AND an ad-network signal,
@@ -1358,36 +1366,59 @@ audio *,
     };
   })();
 
-  /* ══ Schedule execution ══ */
-  nuke();
-  removeClickjackOverlays();
-  sanitizeLinks();
-  blockMetaRefresh();
-  setTimeout(nuke, 150);
-  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 300);
-  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 600);
-  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 1000);
-  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 1500);
-  setTimeout(function() { nuke(); tryDismissConsent(); dismissAntiAdblock(); removeClickjackOverlays(); sanitizeLinks(); }, 2000);
-  setTimeout(function() { nuke(); sanitizeLinks(); removeClickjackOverlays(); }, 3000);
-  setTimeout(function() { tryDismissConsent(); dismissAntiAdblock(); removeClickjackOverlays(); sanitizeLinks(); blockMetaRefresh(); }, 4000);
-  setTimeout(function() { nuke(); removeClickjackOverlays(); sanitizeLinks(); }, 6000);
-  setInterval(handleYouTubeAds, 500); /* YouTube ads can appear at any time */
-  setInterval(function() { removeClickjackOverlays(); sanitizeLinks(); }, 1500);
+  /* ══ Schedule execution
+   *    PERFORMANCE: the heavy DOM-walking helpers (removeClickjackOverlays,
+   *    sanitizeLinks) call getComputedStyle/getBoundingClientRect on hundreds
+   *    of elements, so we run them sparingly. nuke() only uses static
+   *    selectors and is much cheaper. ══ */
+  var __isYouTube = location.hostname.indexOf('youtube') !== -1;
+  var __isVideoHost = !!window.__rlIsVideoHost;
 
-  /* ══ MutationObserver for dynamic ads ══ */
+  // Always run the cheap pass immediately and once shortly after.
+  nuke();
+  blockMetaRefresh();
+  setTimeout(nuke, 800);
+  setTimeout(function() { nuke(); tryDismissConsent(); dismissAntiAdblock(); }, 2500);
+
+  // Only run the expensive style/bounding-rect sweep a couple of times,
+  // and never on whitelisted video hosts (where it both hurts perf and
+  // risks hiding legitimate player chrome).
+  if (!__isVideoHost) {
+    setTimeout(function() {
+      sanitizeLinks();
+      removeClickjackOverlays();
+    }, 1200);
+    setTimeout(function() {
+      sanitizeLinks();
+      removeClickjackOverlays();
+    }, 4000);
+  }
+
+  // YouTube ad handling only runs on YouTube. Other intervals removed.
+  if (__isYouTube) {
+    setInterval(handleYouTubeAds, 1000);
+  }
+
+  /* ══ MutationObserver for dynamic ads.
+   *    Throttled to 1.5s and only runs the cheap nuke() pass — the heavy
+   *    overlay/link sweeps are too expensive to run on every mutation. ══ */
   if (typeof MutationObserver !== 'undefined') {
     var throttle = null;
+    var lastHeavyRun = 0;
     new MutationObserver(function() {
       if (throttle) return;
       throttle = setTimeout(function() {
         throttle = null;
         nuke();
-        dismissAntiAdblock();
-        handleYouTubeAds();
-        removeClickjackOverlays();
-        sanitizeLinks();
-      }, 250);
+        if (__isYouTube) handleYouTubeAds();
+        // Run the expensive sweep at most once every 8 seconds, and never
+        // on video hosts.
+        var now = Date.now();
+        if (!__isVideoHost && (now - lastHeavyRun) > 8000) {
+          lastHeavyRun = now;
+          dismissAntiAdblock();
+        }
+      }, 1500);
     }).observe(document.body || document.documentElement, {
       childList: true, subtree: true
     });
