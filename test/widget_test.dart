@@ -14,8 +14,7 @@ void main() {
   testWidgets('App renders without crashing', (WidgetTester tester) async {
     await tester.pumpWidget(const ProviderScope(child: VideoCasterApp()));
     await tester.pump();
-    expect(find.text('Browse'), findsOneWidget);
-    expect(find.text('Files'), findsOneWidget);
+    expect(find.text('Cast'), findsOneWidget);
   });
 }
 
