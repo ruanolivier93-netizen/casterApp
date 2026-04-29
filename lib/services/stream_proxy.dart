@@ -101,16 +101,17 @@ class StreamProxyService {
   }
 
   /// The stream URL the TV should fetch.
-  String? get streamEndpoint =>
-      _server == null ? null : 'http://${_server!.address.host}:${_server!.port}/stream';
+  String? get streamEndpoint => _server == null
+      ? null
+      : 'http://${_server!.address.host}:${_server!.port}/stream';
 
   /// The subtitle URL the TV should fetch (null if no subs loaded).
   String? get subtitleEndpoint => _subtitleSrt != null && _server != null
       ? 'http://${_server!.address.host}:${_server!.port}/subtitle.srt'
       : null;
 
-    /// WebVTT subtitle endpoint for Cast receivers.
-    String? get subtitleVttEndpoint => _subtitleSrt != null && _server != null
+  /// WebVTT subtitle endpoint for Cast receivers.
+  String? get subtitleVttEndpoint => _subtitleSrt != null && _server != null
       ? 'http://${_server!.address.host}:${_server!.port}/subtitle.vtt'
       : null;
 
@@ -136,7 +137,9 @@ class StreamProxyService {
         'User-Agent': ua,
         'Accept': '*/*',
         'Origin': _originHost ?? '${parsedUrl.scheme}://${parsedUrl.host}',
-        'Referer': _originHost != null ? '$_originHost/' : '${parsedUrl.scheme}://${parsedUrl.host}/',
+        'Referer': _originHost != null
+            ? '$_originHost/'
+            : '${parsedUrl.scheme}://${parsedUrl.host}/',
         ..._extraHeaders,
       };
 
@@ -144,7 +147,8 @@ class StreamProxyService {
         // HLS — fetch manifest and calculate total duration from #EXTINF tags
         final req = http.Request('GET', Uri.parse(streamUrl))
           ..headers.addAll(headers);
-        final resp = await probeClient.send(req).timeout(const Duration(seconds: 15));
+        final resp =
+            await probeClient.send(req).timeout(const Duration(seconds: 15));
         final body = await resp.stream.bytesToString();
         double totalDuration = 0;
         final extinfRegex = RegExp(r'#EXTINF:\s*([\d.]+)');
@@ -160,11 +164,15 @@ class StreamProxyService {
           final variantRegex = RegExp(r'#EXT-X-STREAM-INF:.*\n(.+)');
           final variantMatch = variantRegex.firstMatch(body);
           if (variantMatch != null) {
-            final variantUrl = Uri.parse(streamUrl).resolve(variantMatch.group(1)!.trim()).toString();
+            final variantUrl = Uri.parse(streamUrl)
+                .resolve(variantMatch.group(1)!.trim())
+                .toString();
             try {
               final vReq = http.Request('GET', Uri.parse(variantUrl))
                 ..headers.addAll(headers);
-              final vResp = await probeClient.send(vReq).timeout(const Duration(seconds: 15));
+              final vResp = await probeClient
+                  .send(vReq)
+                  .timeout(const Duration(seconds: 15));
               final vBody = await vResp.stream.bytesToString();
               double vDuration = 0;
               for (final m in extinfRegex.allMatches(vBody)) {
@@ -188,7 +196,9 @@ class StreamProxyService {
             }
             final req = http.Request(method, Uri.parse(streamUrl))
               ..headers.addAll(probHeaders);
-            final resp = await probeClient.send(req).timeout(const Duration(seconds: 15));
+            final resp = await probeClient
+                .send(req)
+                .timeout(const Duration(seconds: 15));
             await resp.stream.drain<void>();
 
             // Check Content-Range first (from 206 response)
@@ -330,7 +340,8 @@ class StreamProxyService {
         }
         end = end.clamp(start, fileLength - 1);
         req.response.statusCode = 206;
-        req.response.headers.set('Content-Range', 'bytes $start-$end/$fileLength');
+        req.response.headers
+            .set('Content-Range', 'bytes $start-$end/$fileLength');
       } else {
         req.response.statusCode = 200;
       }
@@ -385,7 +396,9 @@ class StreamProxyService {
         'Accept-Language': 'en-US,en;q=0.9',
         'Connection': 'keep-alive',
         'Origin': _originHost ?? '${parsedUrl.scheme}://${parsedUrl.host}',
-        'Referer': _originHost != null ? '$_originHost/' : '${parsedUrl.scheme}://${parsedUrl.host}/',
+        'Referer': _originHost != null
+            ? '$_originHost/'
+            : '${parsedUrl.scheme}://${parsedUrl.host}/',
         ..._extraHeaders,
       };
 
@@ -401,7 +414,8 @@ class StreamProxyService {
         try {
           final upstreamReq = http.Request(method, Uri.parse(streamUrl))
             ..headers.addAll(baseHeaders);
-          upstreamResp = await reqClient.send(upstreamReq)
+          upstreamResp = await reqClient
+              .send(upstreamReq)
               .timeout(const Duration(seconds: 60));
           break;
         } catch (e) {
@@ -411,7 +425,8 @@ class StreamProxyService {
           }
         }
       }
-      if (upstreamResp == null) throw lastError ?? Exception('Upstream fetch failed');
+      if (upstreamResp == null)
+        throw lastError ?? Exception('Upstream fetch failed');
 
       // ── Adaptive manifest? Rewrite URLs so everything goes through the proxy ──
       final ct = upstreamResp.headers['content-type'] ?? '';
@@ -431,23 +446,55 @@ class StreamProxyService {
         totalFileSize = _probedContentLength;
       }
 
+      final rangeMatch = tvRange != null
+          ? RegExp(r'bytes=(\d+)-(\d*)').firstMatch(tvRange)
+          : null;
+      final requestedRangeStart =
+          rangeMatch != null ? int.parse(rangeMatch.group(1)!) : null;
+      final requestedRangeEnd =
+          rangeMatch != null && (rangeMatch.group(2)?.isNotEmpty ?? false)
+              ? int.parse(rangeMatch.group(2)!)
+              : null;
+      final rangeCapable = upstreamResp.statusCode == 206 ||
+          upstreamResp.headers['accept-ranges']?.toLowerCase() == 'bytes';
+
+      int? expectedResponseBytes;
+      if (totalFileSize != null) {
+        if (requestedRangeStart != null) {
+          final requestedEnd = requestedRangeEnd ?? totalFileSize - 1;
+          if (requestedRangeStart <= requestedEnd) {
+            expectedResponseBytes = requestedEnd - requestedRangeStart + 1;
+          }
+        } else {
+          expectedResponseBytes = totalFileSize;
+        }
+      }
+
       // ── Set response headers ───────────────────────────────────────────
-      // If we know the total size, tell the TV via Content-Length. This is
-      // crucial for TVs to show the progress bar and allow seeking.
+      // Keep Range semantics aligned with what upstream actually returned.
       if (totalFileSize != null && tvRange == null) {
-        // No Range from TV → serve full file
         req.response.statusCode = 200;
         req.response.headers.set('content-length', '$totalFileSize');
-      } else if (totalFileSize != null && tvRange != null) {
-        // TV sent Range → serve partial content with proper headers
-        final rangeMatch = RegExp(r'bytes=(\d+)-(\d*)').firstMatch(tvRange);
-        final start = int.parse(rangeMatch?.group(1) ?? '0');
-        final end = totalFileSize - 1;
+      } else if (requestedRangeStart != null &&
+          upstreamResp.statusCode == 206) {
         req.response.statusCode = 206;
-        req.response.headers.set('content-range', 'bytes $start-$end/$totalFileSize');
-        req.response.headers.set('content-length', '${end - start + 1}');
+        final upstreamContentRange = upstreamResp.headers['content-range'];
+        if (upstreamContentRange != null) {
+          req.response.headers.set('content-range', upstreamContentRange);
+        } else if (totalFileSize != null) {
+          final requestedEnd = requestedRangeEnd ?? totalFileSize - 1;
+          req.response.headers.set(
+            'content-range',
+            'bytes $requestedRangeStart-$requestedEnd/$totalFileSize',
+          );
+        }
+        final upstreamContentLength = upstreamResp.headers['content-length'];
+        if (upstreamContentLength != null) {
+          req.response.headers.set('content-length', upstreamContentLength);
+        } else if (expectedResponseBytes != null) {
+          req.response.headers.set('content-length', '$expectedResponseBytes');
+        }
       } else {
-        // Unknown size — pass through upstream status
         req.response.statusCode = upstreamResp.statusCode;
         for (final entry in upstreamResp.headers.entries) {
           switch (entry.key.toLowerCase()) {
@@ -458,10 +505,12 @@ class StreamProxyService {
         }
       }
 
-      // Always set these regardless
       final upstreamCt = upstreamResp.headers['content-type'];
-      req.response.headers.set('content-type', upstreamCt ?? _guessMime(streamUrl));
-      req.response.headers.set('accept-ranges', 'bytes');
+      req.response.headers
+          .set('content-type', upstreamCt ?? _guessMime(streamUrl));
+      if (rangeCapable) {
+        req.response.headers.set('accept-ranges', 'bytes');
+      }
       req.response.headers.set('Access-Control-Allow-Origin', '*');
 
       if (isHead) {
@@ -485,36 +534,39 @@ class StreamProxyService {
       //  2. Unknown size: if we got some data but the stream closed
       //     suspiciously fast (< 30MB in under ~10 seconds of data),
       //     try one resume with Range header - if server accepts, keep going.
-      final knownSize = totalFileSize;
-      final needsResume = (knownSize != null && bytesSent < knownSize) ||
-          (knownSize == null && bytesSent > 0 && bytesSent < 30 * 1024 * 1024);
+      final expectedLength = expectedResponseBytes;
+      final needsResume =
+          (expectedLength != null && bytesSent < expectedLength) ||
+              (expectedLength == null &&
+                  bytesSent > 0 &&
+                  bytesSent < 30 * 1024 * 1024);
 
       if (needsResume) {
         int absoluteOffset = bytesSent;
-        if (tvRange != null) {
-          final match = RegExp(r'bytes=(\d+)-').firstMatch(tvRange);
-          if (match != null) {
-            absoluteOffset = int.parse(match.group(1)!) + bytesSent;
-          }
+        if (requestedRangeStart != null) {
+          absoluteOffset = requestedRangeStart + bytesSent;
         }
 
         const maxResumes = 2000;
         for (var i = 0; i < maxResumes; i++) {
           // Stop if we've delivered everything
-          if (knownSize != null && bytesSent >= knownSize) break;
+          if (expectedLength != null && bytesSent >= expectedLength) break;
 
           try {
             final resumeClient = http.Client();
             try {
               final resumeHeaders = Map<String, String>.from(baseHeaders);
-              resumeHeaders['Range'] = 'bytes=$absoluteOffset-';
+              final resumeRange = requestedRangeEnd != null
+                  ? 'bytes=$absoluteOffset-$requestedRangeEnd'
+                  : 'bytes=$absoluteOffset-';
               // Remove any original Range the TV sent
               resumeHeaders.remove('range');
-              resumeHeaders['Range'] = 'bytes=$absoluteOffset-';
+              resumeHeaders['Range'] = resumeRange;
 
               final resumeReq = http.Request('GET', Uri.parse(streamUrl))
                 ..headers.addAll(resumeHeaders);
-              final resumeResp = await resumeClient.send(resumeReq)
+              final resumeResp = await resumeClient
+                  .send(resumeReq)
                   .timeout(const Duration(seconds: 60));
 
               // If server returns 416 (Range Not Satisfiable), we're done
@@ -522,13 +574,9 @@ class StreamProxyService {
                 await resumeResp.stream.drain<void>();
                 break;
               }
-              // If server returns 200 (ignores Range), we can't auto-resume
-              if (resumeResp.statusCode == 200 && i == 0) {
-                // Server doesn't support Range — pipe what we can and stop
-                await for (final chunk in resumeResp.stream) {
-                  req.response.add(chunk);
-                  bytesSent += chunk.length;
-                }
+              // If server ignores Range on resume, stop before duplicating bytes.
+              if (resumeResp.statusCode == 200) {
+                await resumeResp.stream.drain<void>();
                 break;
               }
 
@@ -708,7 +756,9 @@ class StreamProxyService {
     bool preserveTemplateTokens = false,
   }) {
     final attribute = element.getAttributeNode(attributeName) ??
-        element.attributes.where((attr) => attr.name.qualified == attributeName).firstOrNull;
+        element.attributes
+            .where((attr) => attr.name.qualified == attributeName)
+            .firstOrNull;
     if (attribute == null) return;
 
     final value = attribute.value.trim();
@@ -730,7 +780,8 @@ class StreamProxyService {
     });
   }
 
-  String _buildProxyUrl(String resolvedUrl, {bool preserveTemplateTokens = true}) {
+  String _buildProxyUrl(String resolvedUrl,
+      {bool preserveTemplateTokens = true}) {
     return '$_baseUrl/proxy?url=${_encodeProxyUrl(resolvedUrl, preserveTemplateTokens: preserveTemplateTokens)}';
   }
 
@@ -811,7 +862,8 @@ class StreamProxyService {
     if (lower.endsWith('.webm')) return 'video/webm';
     if (lower.endsWith('.mkv')) return 'video/x-matroska';
     if (lower.endsWith('.avi')) return 'video/x-msvideo';
-    if (lower.endsWith('.mov') || lower.endsWith('.qt')) return 'video/quicktime';
+    if (lower.endsWith('.mov') || lower.endsWith('.qt'))
+      return 'video/quicktime';
     if (lower.endsWith('.ts')) return 'video/mp2t';
     if (lower.endsWith('.flv')) return 'video/x-flv';
     if (lower.endsWith('.3gp')) return 'video/3gpp';

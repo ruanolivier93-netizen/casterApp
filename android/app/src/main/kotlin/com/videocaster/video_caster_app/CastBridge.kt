@@ -6,6 +6,7 @@ import androidx.mediarouter.app.MediaRouteChooserDialogFragment
 import com.google.android.gms.cast.MediaInfo
 import com.google.android.gms.cast.MediaLoadRequestData
 import com.google.android.gms.cast.MediaMetadata
+import com.google.android.gms.cast.MediaSeekOptions
 import com.google.android.gms.cast.MediaStatus
 import com.google.android.gms.cast.MediaTrack
 import com.google.android.gms.cast.framework.CastContext
@@ -114,7 +115,19 @@ object CastBridge : MethodChannel.MethodCallHandler, EventChannel.StreamHandler 
                 }
                 "seekTo" -> {
                     val positionMs = call.argument<Number>("positionMs")?.toLong() ?: 0L
-                    currentClient()?.seek(positionMs)
+                    val client = currentClient()
+                    val resumeState = when (client?.mediaStatus?.playerState) {
+                        MediaStatus.PLAYER_STATE_PLAYING,
+                        MediaStatus.PLAYER_STATE_BUFFERING -> RemoteMediaClient.RESUME_STATE_PLAY
+                        MediaStatus.PLAYER_STATE_PAUSED -> RemoteMediaClient.RESUME_STATE_PAUSE
+                        else -> RemoteMediaClient.RESUME_STATE_UNCHANGED
+                    }
+                    val seekOptions = MediaSeekOptions.Builder()
+                        .setPosition(positionMs)
+                        .setResumeState(resumeState)
+                        .build()
+                    client?.seek(seekOptions)
+                    client?.requestStatus()
                     result.success(true)
                 }
                 "setVolume" -> {

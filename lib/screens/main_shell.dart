@@ -78,35 +78,10 @@ class _MainShellState extends ConsumerState<MainShell> {
     }
   }
 
-  /// Called from BrowserScreen when the user taps "Cast this page".
-  void _onCastUrlFromBrowser(String url) {
-    // Put the URL in the provider so the Cast tab also picks it up,
-    // but do NOT switch tabs — the browser has its own cast controls.
-    ref.read(browserCastUrlProvider.notifier).state = url;
-    ref.read(selectedFormatProvider.notifier).state = null;
-
-    final uri = Uri.tryParse(url);
-    final host = uri?.host.toLowerCase() ?? '';
-    final path = uri?.path.toLowerCase() ?? '';
-    const videoExts = [
-      '.mp4', '.m4v', '.webm', '.mkv', '.avi', '.mov', '.flv',
-      '.ts', '.3gp', '.wmv', '.ogv', '.m3u8', '.mpd',
-    ];
-
-    if (host.contains('youtube.com') || host.contains('youtu.be') ||
-        host.contains('m.youtube.com')) {
-      ref.read(videoProvider.notifier).extract(url);
-    } else if (videoExts.any((e) => path.contains(e))) {
-      ref.read(videoProvider.notifier).loadDirect(url);
-    } else {
-      ref.read(videoProvider.notifier).extract(url);
-    }
-    // Stay on the browser tab — cast panel shows inline.
-  }
-
   @override
   Widget build(BuildContext context) {
-    final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
+    final isLandscape =
+        MediaQuery.of(context).orientation == Orientation.landscape;
 
     return PopScope(
       canPop: false,
@@ -134,7 +109,6 @@ class _MainShellState extends ConsumerState<MainShell> {
             const HomeScreen(),
             if (_browserInitialised)
               BrowserScreen(
-                onCastUrl: _onCastUrlFromBrowser,
                 onControllerCreated: (c) => _webController = c,
               )
             else
@@ -247,7 +221,11 @@ class _SimpleNavItem extends StatelessWidget {
         curve: Curves.easeOut,
         margin: const EdgeInsets.symmetric(horizontal: 2),
         decoration: BoxDecoration(
-          color: selected ? (Theme.of(context).brightness == Brightness.dark ? const Color(0xFF23272B) : const Color(0xFFE7E0D6)) : Colors.transparent,
+          color: selected
+              ? (Theme.of(context).brightness == Brightness.dark
+                  ? const Color(0xFF23272B)
+                  : const Color(0xFFE7E0D6))
+              : Colors.transparent,
           borderRadius: BorderRadius.circular(18),
         ),
         child: InkWell(
@@ -258,7 +236,9 @@ class _SimpleNavItem extends StatelessWidget {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Icon(selected ? selectedIcon : icon, color: selected ? cs.primary : cs.onSurfaceVariant, size: 21),
+                Icon(selected ? selectedIcon : icon,
+                    color: selected ? cs.primary : cs.onSurfaceVariant,
+                    size: 21),
                 const SizedBox(height: 4),
                 Text(
                   label,

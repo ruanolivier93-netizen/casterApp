@@ -14,9 +14,6 @@ import '../providers/native_cast_provider.dart';
 import '../providers/privacy_telemetry.dart';
 import '../models/dlna_device.dart';
 
-/// Callback when user taps "Cast" on a detected video URL.
-typedef OnCastUrl = void Function(String url);
-
 // ── Quick-access bookmarks ──────────────────────────────────────────────────
 
 class _Bookmark {
@@ -174,10 +171,8 @@ const _kMaxTabs = 8;
 // ── Browser Screen ──────────────────────────────────────────────────────────
 
 class BrowserScreen extends ConsumerStatefulWidget {
-  final OnCastUrl onCastUrl;
   final ValueChanged<InAppWebViewController>? onControllerCreated;
-  const BrowserScreen(
-      {super.key, required this.onCastUrl, this.onControllerCreated});
+  const BrowserScreen({super.key, this.onControllerCreated});
 
   @override
   ConsumerState<BrowserScreen> createState() => _BrowserScreenState();
@@ -673,38 +668,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         host.contains('m.youtube.com');
   }
 
-  String _normalizeForCast(String url) {
-    if (url.contains('youtube.com/embed/')) {
-      final uri = Uri.tryParse(url);
-      if (uri != null) {
-        final parts = uri.pathSegments;
-        final idx = parts.indexOf('embed');
-        if (idx >= 0 && idx + 1 < parts.length) {
-          return 'https://www.youtube.com/watch?v=${parts[idx + 1]}';
-        }
-      }
-    }
-    if (url.contains('youtube.com/shorts/')) {
-      final uri = Uri.tryParse(url);
-      if (uri != null && uri.pathSegments.length >= 2) {
-        return 'https://www.youtube.com/watch?v=${uri.pathSegments[1]}';
-      }
-    }
-    if (url.contains('player.vimeo.com/video/')) {
-      final uri = Uri.tryParse(url);
-      if (uri != null && uri.pathSegments.length >= 2) {
-        return 'https://vimeo.com/${uri.pathSegments.last}';
-      }
-    }
-    if (url.contains('dailymotion.com/embed/video/')) {
-      final uri = Uri.tryParse(url);
-      if (uri != null && uri.pathSegments.isNotEmpty) {
-        return 'https://www.dailymotion.com/video/${uri.pathSegments.last}';
-      }
-    }
-    return url;
-  }
-
   String _videoLabel(String url) {
     final uri = Uri.tryParse(url);
     if (uri == null) return url;
@@ -769,79 +732,12 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     }
   }
 
-  void _castBest() {
-    // Store the current page URL so the proxy can use it as Referer.
-    ref.read(browserPageUrlProvider.notifier).state = _currentUrl;
-    if (_detectedVideos.isNotEmpty) {
-      final sorted = List<_DetectedVideo>.from(_detectedVideos)
-        ..sort((a, b) => a.priority.compareTo(b.priority));
-      widget.onCastUrl(_normalizeForCast(sorted.first.url));
-    } else if (_isPlatformUrl(_currentUrl)) {
-      widget.onCastUrl(_normalizeForCast(_currentUrl));
-    }
-  }
-
-  void _showVideoPicker() {
-    final settings = ref.read(settingsProvider);
-    final pageTitle = _activeTab.title;
-    final thumbnail = _activeTab.thumbnailUrl;
-
-    // Sort: direct streams first, embeds last
-    final sorted = List<_DetectedVideo>.from(_detectedVideos)
-      ..sort((a, b) => a.priority.compareTo(b.priority));
-
-    // Also add current page URL if it's a platform URL and not already in list
-    final items = <_DetectedVideo>[...sorted];
-    if (_isPlatformUrl(_currentUrl) &&
-        !items.any((v) =>
-            _normalizeForCast(v.url) == _normalizeForCast(_currentUrl))) {
-      items.insert(0, _DetectedVideo(url: _currentUrl, type: 'page'));
-    }
-
-    Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (ctx) => _VideoListScreen(
-          items: items,
-          pageTitle: pageTitle,
-          thumbnailUrl: thumbnail,
-          routeThroughPhone: settings.routeThroughPhone,
-          onCast: (video) {
-            ref.read(browserPageUrlProvider.notifier).state = _currentUrl;
-            widget.onCastUrl(_normalizeForCast(video.url));
-          },
-          onToggleRoute: () {
-            ref.read(settingsProvider.notifier).toggle();
-          },
-          onDownload: (video) {
-            ref.read(downloadServiceProvider).download(
-                  url: video.url,
-                  filename: _filenameFromUrl(video.url),
-                );
-            ScaffoldMessenger.of(ctx).showSnackBar(
-              const SnackBar(
-                content: Text('Download started — check Files tab'),
-                duration: Duration(seconds: 2),
-              ),
-            );
-          },
-        ),
-      ),
-    );
-  }
-
-  int get _castableCount {
-    int count = _detectedVideos.length;
-    if (_isPlatformUrl(_currentUrl)) count = count > 0 ? count : 1;
-    return count;
-  }
-
   // ── Build ─────────────────────────────────────────────────────────────────
 
   @override
   Widget build(BuildContext context) {
     super.build(context);
     final cs = Theme.of(context).colorScheme;
-    final hasCastable = _castableCount > 0;
     final settings = ref.watch(settingsProvider);
     final nativeCastState = ref.watch(nativeCastProvider);
 
@@ -857,20 +753,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         titleSpacing: 12,
         title: _buildUrlBar(cs),
         actions: [
-          // ── Cast button — the star of the show ──
-          if (hasCastable)
-            _AnimatedCastButton(
-              count: _castableCount,
-              onTap: _castableCount == 1 && _detectedVideos.isEmpty
-                  ? _castBest // single platform page → cast directly
-                  : _showVideoPicker,
-            ),
-          if (!hasCastable)
-            IconButton(
-              icon: const Icon(Icons.cast_outlined, size: 22),
-              tooltip: 'No videos detected',
-              onPressed: null, // disabled look
-            ),
           IconButton(
             icon: Icon(
               nativeCastState.connected
@@ -1151,60 +1033,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
               icon: const Icon(Icons.arrow_forward_ios, size: 18),
               tooltip: 'Forward',
               onPressed: _canGoForward ? () => _controller?.goForward() : null,
-            ),
-            IconButton(
-              icon: const Icon(Icons.home_outlined, size: 20),
-              tooltip: 'Home',
-              onPressed: () {
-                setState(() => _showBookmarks = true);
-                _controller?.loadUrl(
-                    urlRequest:
-                        URLRequest(url: WebUri('https://www.google.com')));
-              },
-            ),
-            // ── Tab counter ──
-            _TabCountButton(
-              count: _tabs.length,
-              onTap: _tabs.length > 1 ? _showTabOverview : () => _addNewTab(),
-            ),
-            IconButton(
-              icon: Icon(
-                settings.adBlockEnabled ? Icons.shield : Icons.shield_outlined,
-                size: 20,
-                color: settings.adBlockEnabled ? cs.primary : null,
-              ),
-              tooltip: settings.adBlockEnabled
-                  ? 'Ad blocker: on'
-                  : 'Ad blocker: off',
-              onPressed: () {
-                final enabled = !settings.adBlockEnabled;
-                ref.read(settingsProvider.notifier).toggleAdBlock();
-                ref.read(telemetryProvider.notifier).log(
-                  'adblock_toggled',
-                  payload: {'enabled': enabled},
-                );
-              },
-            ),
-            IconButton(
-              icon: Icon(
-                isBookmarked ? Icons.bookmark : Icons.bookmark_border,
-                size: 20,
-                color: isBookmarked ? cs.primary : null,
-              ),
-              tooltip: isBookmarked ? 'Remove bookmark' : 'Bookmark this page',
-              onPressed: () {
-                if (_currentUrl.isEmpty) return;
-                if (isBookmarked) {
-                  ref.read(bookmarksProvider.notifier).remove(_currentUrl);
-                } else {
-                  ref.read(bookmarksProvider.notifier).add(
-                        _currentUrl,
-                        _urlController.text,
-                      );
-                }
-              },
-            ),
-            IconButton(
               icon: const Icon(Icons.history, size: 20),
               tooltip: 'History',
               onPressed: _showHistorySheet,
@@ -2049,9 +1877,9 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                         Expanded(
                           child: Text(
                             effectiveCastDevice?.name ??
-                              (isScanning
-                                ? 'Scanning DLNA TVs…'
-                                : 'Select TV or connect Cast'),
+                                (isScanning
+                                    ? 'Scanning DLNA TVs…'
+                                    : 'Select TV or connect Cast'),
                             style: TextStyle(
                               fontSize: 12,
                               color: effectiveCastDevice != null
@@ -2094,13 +1922,13 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                               videoState.info.title,
                               videoState.info.thumbnailUrl,
                             );
-                    if (selectedDevice != null) {
-                      ref
-                        .read(lastDeviceProvider.notifier)
-                        .save(selectedDevice.location);
-                    }
+                        if (selectedDevice != null) {
+                          ref
+                              .read(lastDeviceProvider.notifier)
+                              .save(selectedDevice.location);
+                        }
                         ref.read(castProvider.notifier).cast(
-                        device: effectiveCastDevice,
+                              device: effectiveCastDevice,
                               format: selectedFormat,
                               title: videoState.info.title,
                               routeThroughPhone: settings.routeThroughPhone,
@@ -2412,321 +2240,5 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
     final m = (d.inMinutes % 60).toString().padLeft(2, '0');
     final s = (d.inSeconds % 60).toString().padLeft(2, '0');
     return h > 0 ? '$h:$m:$s' : '$m:$s';
-  }
-}
-
-// ── Video List Screen (WVC-style) ───────────────────────────────────────────
-
-class _VideoListScreen extends StatefulWidget {
-  final List<_DetectedVideo> items;
-  final String pageTitle;
-  final String? thumbnailUrl;
-  final bool routeThroughPhone;
-  final void Function(_DetectedVideo) onCast;
-  final VoidCallback onToggleRoute;
-  final void Function(_DetectedVideo) onDownload;
-
-  const _VideoListScreen({
-    required this.items,
-    required this.pageTitle,
-    this.thumbnailUrl,
-    required this.routeThroughPhone,
-    required this.onCast,
-    required this.onToggleRoute,
-    required this.onDownload,
-  });
-
-  @override
-  State<_VideoListScreen> createState() => _VideoListScreenState();
-}
-
-class _VideoListScreenState extends State<_VideoListScreen> {
-  late bool _routeThroughPhone;
-
-  @override
-  void initState() {
-    super.initState();
-    _routeThroughPhone = widget.routeThroughPhone;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-    final tt = Theme.of(context).textTheme;
-
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Video list'),
-        leading: IconButton(
-          icon: const Icon(Icons.arrow_back),
-          onPressed: () => Navigator.pop(context),
-        ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.cast, size: 22),
-            tooltip: 'Cast best',
-            onPressed: widget.items.isNotEmpty
-                ? () {
-                    Navigator.pop(context);
-                    widget.onCast(widget.items.first);
-                  }
-                : null,
-          ),
-          PopupMenuButton<String>(
-            icon: const Icon(Icons.more_vert),
-            onSelected: (val) {
-              // Future: add more menu actions
-            },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'help', child: Text('Help')),
-            ],
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // ── Route through phone toggle ──
-          Material(
-            color: cs.surfaceContainerLow,
-            child: InkWell(
-              onTap: () {
-                setState(() => _routeThroughPhone = !_routeThroughPhone);
-                widget.onToggleRoute();
-              },
-              child: Padding(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                child: Row(
-                  children: [
-                    Icon(Icons.phone_android,
-                        size: 20, color: cs.onSurfaceVariant),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: Text(
-                        'Route video through phone',
-                        style: tt.bodyMedium?.copyWith(color: cs.onSurface),
-                      ),
-                    ),
-                    SizedBox(
-                      width: 24,
-                      height: 24,
-                      child: Checkbox(
-                        value: _routeThroughPhone,
-                        onChanged: (_) {
-                          setState(
-                              () => _routeThroughPhone = !_routeThroughPhone);
-                          widget.onToggleRoute();
-                        },
-                        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ),
-          const Divider(height: 1),
-          // ── Video items list ──
-          Expanded(
-            child: widget.items.isEmpty
-                ? Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
-                        Icon(Icons.videocam_off,
-                            size: 48,
-                            color: cs.onSurfaceVariant.withAlpha(100)),
-                        const SizedBox(height: 12),
-                        Text('No videos detected',
-                            style: tt.bodyLarge
-                                ?.copyWith(color: cs.onSurfaceVariant)),
-                      ],
-                    ),
-                  )
-                : ListView.separated(
-                    itemCount: widget.items.length,
-                    separatorBuilder: (_, __) =>
-                        const Divider(height: 1, indent: 80),
-                    itemBuilder: (ctx, i) {
-                      final video = widget.items[i];
-                      return _VideoListTile(
-                        video: video,
-                        pageTitle: widget.pageTitle,
-                        thumbnailUrl: widget.thumbnailUrl,
-                        onTap: () {
-                          Navigator.pop(context);
-                          widget.onCast(video);
-                        },
-                        onDownload: () {
-                          widget.onDownload(video);
-                        },
-                      );
-                    },
-                  ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ── Video List Tile (WVC-style) ─────────────────────────────────────────────
-
-class _VideoListTile extends StatelessWidget {
-  final _DetectedVideo video;
-  final String pageTitle;
-  final String? thumbnailUrl;
-  final VoidCallback onTap;
-  final VoidCallback onDownload;
-
-  const _VideoListTile({
-    required this.video,
-    required this.pageTitle,
-    this.thumbnailUrl,
-    required this.onTap,
-    required this.onDownload,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
-
-    return InkWell(
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-        child: Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            // ── Thumbnail ──
-            ClipRRect(
-              borderRadius: BorderRadius.circular(6),
-              child: SizedBox(
-                width: 60,
-                height: 44,
-                child: thumbnailUrl != null && thumbnailUrl!.isNotEmpty
-                    ? Image.network(
-                        thumbnailUrl!,
-                        fit: BoxFit.cover,
-                        errorBuilder: (_, __, ___) => Container(
-                          color: cs.surfaceContainerHighest,
-                          child: Icon(Icons.play_circle_outline,
-                              size: 24, color: cs.onSurfaceVariant),
-                        ),
-                      )
-                    : Container(
-                        color: cs.surfaceContainerHighest,
-                        child: Icon(Icons.play_circle_outline,
-                            size: 24, color: cs.onSurfaceVariant),
-                      ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            // ── Info column ──
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  // Page title
-                  Text(
-                    pageTitle.isNotEmpty ? pageTitle : 'Untitled',
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.w500,
-                      color: cs.onSurface,
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  // Host domain
-                  Text(
-                    video.hostLabel,
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: TextStyle(fontSize: 11, color: cs.onSurfaceVariant),
-                  ),
-                  const SizedBox(height: 4),
-                  // Stream label + format badge row
-                  Row(
-                    children: [
-                      if (video.streamLabel.isNotEmpty)
-                        Flexible(
-                          child: Text(
-                            video.streamLabel,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                              fontSize: 11,
-                              fontWeight: FontWeight.w500,
-                              color: cs.onSurfaceVariant,
-                            ),
-                          ),
-                        ),
-                      if (video.streamLabel.isNotEmpty)
-                        const SizedBox(width: 8),
-                      Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 6, vertical: 2),
-                        decoration: BoxDecoration(
-                          color: const Color(0xFF2E7D32),
-                          borderRadius: BorderRadius.circular(4),
-                        ),
-                        child: Text(
-                          video.formatBadge,
-                          style: const TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.w600,
-                            color: Colors.white,
-                          ),
-                        ),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            // ── Three-dot menu ──
-            PopupMenuButton<String>(
-              icon: Icon(Icons.more_vert, size: 20, color: cs.onSurfaceVariant),
-              padding: EdgeInsets.zero,
-              constraints: const BoxConstraints(),
-              onSelected: (val) {
-                switch (val) {
-                  case 'cast':
-                    onTap();
-                    break;
-                  case 'download':
-                    onDownload();
-                    break;
-                }
-              },
-              itemBuilder: (_) => [
-                const PopupMenuItem(
-                  value: 'cast',
-                  child: ListTile(
-                    dense: true,
-                    leading: Icon(Icons.cast, size: 20),
-                    title: Text('Cast', style: TextStyle(fontSize: 13)),
-                    contentPadding: EdgeInsets.zero,
-                    visualDensity: VisualDensity.compact,
-                  ),
-                ),
-                const PopupMenuItem(
-                  value: 'download',
-                  child: ListTile(
-                    dense: true,
-                    leading: Icon(Icons.download, size: 20),
-                    title: Text('Download', style: TextStyle(fontSize: 13)),
-                    contentPadding: EdgeInsets.zero,
-                    visualDensity: VisualDensity.compact,
-                  ),
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
   }
 }
