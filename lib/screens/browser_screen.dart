@@ -661,13 +661,6 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     return "'$escaped'";
   }
 
-  bool _isPlatformUrl(String url) {
-    final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
-    return host.contains('youtube.com') ||
-        host.contains('youtu.be') ||
-        host.contains('m.youtube.com');
-  }
-
   String _videoLabel(String url) {
     final uri = Uri.tryParse(url);
     if (uri == null) return url;
@@ -1033,9 +1026,62 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
               icon: const Icon(Icons.arrow_forward_ios, size: 18),
               tooltip: 'Forward',
               onPressed: _canGoForward ? () => _controller?.goForward() : null,
+            ),
+            IconButton(
               icon: const Icon(Icons.history, size: 20),
               tooltip: 'History',
               onPressed: _showHistorySheet,
+            ),
+            IconButton(
+              icon: const Icon(Icons.home_outlined, size: 20),
+              tooltip: 'Home',
+              onPressed: () {
+                setState(() => _showBookmarks = true);
+                _controller?.loadUrl(
+                  urlRequest: URLRequest(url: WebUri('https://www.google.com')),
+                );
+              },
+            ),
+            _TabCountButton(
+              count: _tabs.length,
+              onTap: _tabs.length > 1 ? _showTabOverview : _addNewTab,
+            ),
+            IconButton(
+              icon: Icon(
+                settings.adBlockEnabled ? Icons.shield : Icons.shield_outlined,
+                size: 20,
+                color: settings.adBlockEnabled ? cs.primary : null,
+              ),
+              tooltip: settings.adBlockEnabled
+                  ? 'Ad blocker: on'
+                  : 'Ad blocker: off',
+              onPressed: () {
+                final enabled = !settings.adBlockEnabled;
+                ref.read(settingsProvider.notifier).toggleAdBlock();
+                ref.read(telemetryProvider.notifier).log(
+                  'adblock_toggled',
+                  payload: {'enabled': enabled},
+                );
+              },
+            ),
+            IconButton(
+              icon: Icon(
+                isBookmarked ? Icons.bookmark : Icons.bookmark_border,
+                size: 20,
+                color: isBookmarked ? cs.primary : null,
+              ),
+              tooltip: isBookmarked ? 'Remove bookmark' : 'Bookmark this page',
+              onPressed: () {
+                if (_currentUrl.isEmpty) return;
+                if (isBookmarked) {
+                  ref.read(bookmarksProvider.notifier).remove(_currentUrl);
+                } else {
+                  ref.read(bookmarksProvider.notifier).add(
+                        _currentUrl,
+                        _urlController.text,
+                      );
+                }
+              },
             ),
             IconButton(
               icon: const Icon(Icons.cleaning_services_outlined, size: 20),
@@ -1089,17 +1135,21 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                         children: [
                           Icon(Icons.bookmark, color: cs.primary, size: 22),
                           const SizedBox(width: 8),
-                          Text('Bookmarks',
-                              style: Theme.of(ctx)
-                                  .textTheme
-                                  .titleMedium
-                                  ?.copyWith(fontWeight: FontWeight.w600)),
+                          Text(
+                            'Bookmarks',
+                            style: Theme.of(ctx)
+                                .textTheme
+                                .titleMedium
+                                ?.copyWith(fontWeight: FontWeight.w600),
+                          ),
                           const Spacer(),
                           TextButton(
                             onPressed: () =>
                                 ref.read(bookmarksProvider.notifier).clear(),
-                            child: const Text('Clear all',
-                                style: TextStyle(fontSize: 12)),
+                            child: const Text(
+                              'Clear all',
+                              style: TextStyle(fontSize: 12),
+                            ),
                           ),
                         ],
                       ),
@@ -1108,8 +1158,11 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                     Expanded(
                       child: bookmarks.isEmpty
                           ? Center(
-                              child: Text('No bookmarks yet',
-                                  style: TextStyle(color: cs.onSurfaceVariant)))
+                              child: Text(
+                                'No bookmarks yet',
+                                style: TextStyle(color: cs.onSurfaceVariant),
+                              ),
+                            )
                           : ListView.builder(
                               controller: scrollCtrl,
                               itemCount: bookmarks.length,
@@ -1119,23 +1172,29 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
                                   dense: true,
                                   leading: const Icon(Icons.bookmark, size: 18),
                                   title: Text(
-                                      entry.title.isNotEmpty
-                                          ? entry.title
-                                          : entry.url,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: const TextStyle(fontSize: 13)),
-                                  subtitle: Text(entry.url,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TextStyle(
-                                          fontSize: 11,
-                                          color: cs.onSurfaceVariant)),
+                                    entry.title.isNotEmpty
+                                        ? entry.title
+                                        : entry.url,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: const TextStyle(fontSize: 13),
+                                  ),
+                                  subtitle: Text(
+                                    entry.url,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      color: cs.onSurfaceVariant,
+                                    ),
+                                  ),
                                   onTap: () {
                                     Navigator.pop(ctx);
                                     _controller?.loadUrl(
-                                        urlRequest:
-                                            URLRequest(url: WebUri(entry.url)));
+                                      urlRequest: URLRequest(
+                                        url: WebUri(entry.url),
+                                      ),
+                                    );
                                   },
                                   trailing: IconButton(
                                     icon: const Icon(Icons.close, size: 16),

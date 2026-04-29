@@ -425,8 +425,9 @@ class StreamProxyService {
           }
         }
       }
-      if (upstreamResp == null)
+      if (upstreamResp == null) {
         throw lastError ?? Exception('Upstream fetch failed');
+      }
 
       // ── Adaptive manifest? Rewrite URLs so everything goes through the proxy ──
       final ct = upstreamResp.headers['content-type'] ?? '';
@@ -862,8 +863,9 @@ class StreamProxyService {
     if (lower.endsWith('.webm')) return 'video/webm';
     if (lower.endsWith('.mkv')) return 'video/x-matroska';
     if (lower.endsWith('.avi')) return 'video/x-msvideo';
-    if (lower.endsWith('.mov') || lower.endsWith('.qt'))
+    if (lower.endsWith('.mov') || lower.endsWith('.qt')) {
       return 'video/quicktime';
+    }
     if (lower.endsWith('.ts')) return 'video/mp2t';
     if (lower.endsWith('.flv')) return 'video/x-flv';
     if (lower.endsWith('.3gp')) return 'video/3gpp';
