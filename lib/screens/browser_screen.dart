@@ -661,6 +661,192 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     return "'$escaped'";
   }
 
+  bool _isPlatformUrl(String url) {
+    final host = Uri.tryParse(url)?.host.toLowerCase() ?? '';
+    return host.contains('youtube.com') ||
+        host.contains('youtu.be') ||
+        host.contains('m.youtube.com');
+  }
+
+  String _normalizeForCast(String url) {
+    if (url.contains('youtube.com/embed/')) {
+      final uri = Uri.tryParse(url);
+      if (uri != null) {
+        final parts = uri.pathSegments;
+        final idx = parts.indexOf('embed');
+        if (idx >= 0 && idx + 1 < parts.length) {
+          return 'https://www.youtube.com/watch?v=${parts[idx + 1]}';
+        }
+      }
+    }
+    if (url.contains('youtube.com/shorts/')) {
+      final uri = Uri.tryParse(url);
+      if (uri != null && uri.pathSegments.length >= 2) {
+        return 'https://www.youtube.com/watch?v=${uri.pathSegments[1]}';
+      }
+    }
+    if (url.contains('player.vimeo.com/video/')) {
+      final uri = Uri.tryParse(url);
+      if (uri != null && uri.pathSegments.length >= 2) {
+        return 'https://vimeo.com/${uri.pathSegments.last}';
+      }
+    }
+    if (url.contains('dailymotion.com/embed/video/')) {
+      final uri = Uri.tryParse(url);
+      if (uri != null && uri.pathSegments.isNotEmpty) {
+        return 'https://www.dailymotion.com/video/${uri.pathSegments.last}';
+      }
+    }
+    return url;
+  }
+
+  void _queueVideoForCasting(String url) {
+    final normalizedUrl = _normalizeForCast(url);
+    ref.read(browserPageUrlProvider.notifier).state = _currentUrl;
+    ref.read(selectedFormatProvider.notifier).state = null;
+
+    final uri = Uri.tryParse(normalizedUrl);
+    final host = uri?.host.toLowerCase() ?? '';
+    final path = uri?.path.toLowerCase() ?? '';
+    const videoExts = [
+      '.mp4',
+      '.m4v',
+      '.webm',
+      '.mkv',
+      '.avi',
+      '.mov',
+      '.flv',
+      '.ts',
+      '.3gp',
+      '.wmv',
+      '.ogv',
+      '.m3u8',
+      '.mpd',
+    ];
+
+    if (host.contains('youtube.com') ||
+        host.contains('youtu.be') ||
+        host.contains('m.youtube.com')) {
+      ref.read(videoProvider.notifier).extract(normalizedUrl);
+    } else if (videoExts.any(path.contains)) {
+      ref.read(videoProvider.notifier).loadDirect(normalizedUrl);
+    } else {
+      ref.read(videoProvider.notifier).extract(normalizedUrl);
+    }
+  }
+
+  void _castBest() {
+    if (_detectedVideos.isNotEmpty) {
+      final sorted = List<_DetectedVideo>.from(_detectedVideos)
+        ..sort((a, b) => a.priority.compareTo(b.priority));
+      _queueVideoForCasting(sorted.first.url);
+      return;
+    }
+
+    if (_isPlatformUrl(_currentUrl)) {
+      _queueVideoForCasting(_currentUrl);
+    }
+  }
+
+  void _showVideoPicker() {
+    final cs = Theme.of(context).colorScheme;
+    final sorted = List<_DetectedVideo>.from(_detectedVideos)
+      ..sort((a, b) => a.priority.compareTo(b.priority));
+    final items = <_DetectedVideo>[...sorted];
+
+    if (_isPlatformUrl(_currentUrl) &&
+        !items.any((v) =>
+            _normalizeForCast(v.url) == _normalizeForCast(_currentUrl))) {
+      items.insert(0, _DetectedVideo(url: _currentUrl, type: 'page'));
+    }
+
+    showModalBottomSheet(
+      context: context,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (ctx) {
+        return Padding(
+          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Center(
+                child: Container(
+                  width: 40,
+                  height: 4,
+                  margin: const EdgeInsets.only(bottom: 12),
+                  decoration: BoxDecoration(
+                    color: cs.onSurfaceVariant.withAlpha(80),
+                    borderRadius: BorderRadius.circular(2),
+                  ),
+                ),
+              ),
+              Row(
+                children: [
+                  Icon(Icons.cast, color: cs.primary),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Cast Video',
+                    style: Theme.of(ctx)
+                        .textTheme
+                        .titleMedium
+                        ?.copyWith(fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              if (items.isEmpty)
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 16),
+                  child: Text(
+                    'No videos detected on this page yet.',
+                    style: TextStyle(fontSize: 13, color: cs.onSurfaceVariant),
+                  ),
+                )
+              else
+                ...items.take(10).map(
+                      (video) => ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        dense: true,
+                        leading: Icon(_typeIcon(video.type),
+                            color: cs.primary, size: 20),
+                        title: Text(
+                          _videoLabel(video.url),
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: const TextStyle(fontSize: 13),
+                        ),
+                        subtitle: Text(
+                          _typeLabel(video.type),
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: cs.onSurfaceVariant,
+                          ),
+                        ),
+                        trailing: const Icon(Icons.chevron_right),
+                        onTap: () {
+                          Navigator.pop(ctx);
+                          _queueVideoForCasting(video.url);
+                        },
+                      ),
+                    ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  int get _castableCount {
+    var count = _detectedVideos.length;
+    if (_isPlatformUrl(_currentUrl)) {
+      count = count > 0 ? count : 1;
+    }
+    return count;
+  }
+
   String _videoLabel(String url) {
     final uri = Uri.tryParse(url);
     if (uri == null) return url;
@@ -731,8 +917,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   Widget build(BuildContext context) {
     super.build(context);
     final cs = Theme.of(context).colorScheme;
+    final hasCastable = _castableCount > 0;
     final settings = ref.watch(settingsProvider);
-    final nativeCastState = ref.watch(nativeCastProvider);
 
     if (_adBlockAppliedValue != settings.adBlockEnabled) {
       _adBlockAppliedValue = settings.adBlockEnabled;
@@ -746,18 +932,19 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         titleSpacing: 12,
         title: _buildUrlBar(cs),
         actions: [
-          IconButton(
-            icon: Icon(
-              nativeCastState.connected
-                  ? Icons.cast_connected_rounded
-                  : Icons.cast_outlined,
-              size: 20,
+          if (hasCastable)
+            _AnimatedCastButton(
+              count: _castableCount,
+              onTap: _castableCount == 1 && _detectedVideos.isEmpty
+                  ? _castBest
+                  : _showVideoPicker,
             ),
-            tooltip: nativeCastState.connected
-                ? 'Connected to ${nativeCastState.deviceName ?? 'Chromecast'}'
-                : 'Connect Chromecast',
-            onPressed: () => ref.read(nativeCastProvider.notifier).showDialog(),
-          ),
+          if (!hasCastable)
+            IconButton(
+              icon: const Icon(Icons.cast_outlined, size: 22),
+              tooltip: 'No videos detected',
+              onPressed: null,
+            ),
           IconButton(
             icon: const Icon(Icons.refresh, size: 20),
             tooltip: 'Reload',
@@ -2007,6 +2194,7 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
   void _showDevicePicker(
       ColorScheme cs, List<DlnaDevice> devices, bool isScanning) {
     final selectedDevice = ref.read(selectedDeviceProvider);
+    final nativeCastState = ref.read(nativeCastProvider);
     showModalBottomSheet(
       context: context,
       shape: const RoundedRectangleBorder(
@@ -2069,6 +2257,47 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                     textAlign: TextAlign.center,
                   ),
                 ),
+              ListTile(
+                dense: true,
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(8)),
+                tileColor: nativeCastState.connected
+                    ? cs.primaryContainer.withAlpha(80)
+                    : null,
+                leading: Icon(
+                  nativeCastState.connected
+                      ? Icons.cast_connected_rounded
+                      : Icons.cast_outlined,
+                  color: nativeCastState.connected
+                      ? cs.primary
+                      : cs.onSurfaceVariant,
+                  size: 20,
+                ),
+                title: Text(
+                  nativeCastState.connected
+                      ? (nativeCastState.deviceName ?? 'Chromecast connected')
+                      : 'Connect Chromecast',
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: nativeCastState.connected
+                        ? FontWeight.w600
+                        : FontWeight.normal,
+                  ),
+                ),
+                subtitle: Text(
+                  nativeCastState.connected
+                      ? 'Use the active Cast session'
+                      : 'Open the Cast device chooser',
+                  style: const TextStyle(fontSize: 11),
+                ),
+                trailing: nativeCastState.connected
+                    ? Icon(Icons.check_circle, color: cs.primary, size: 18)
+                    : null,
+                onTap: () {
+                  Navigator.pop(ctx);
+                  ref.read(nativeCastProvider.notifier).showDialog();
+                },
+              ),
               ...devices.map((d) {
                 final sel = selectedDevice == d;
                 return ListTile(
