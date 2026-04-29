@@ -27,17 +27,41 @@ class _MainShellState extends ConsumerState<MainShell> {
   static const _shareChannel = MethodChannel('com.videocaster/share');
   static const _shareStream = EventChannel('com.videocaster/share_stream');
 
+  bool _isMissingPlugin(Object error) =>
+      error is MissingPluginException ||
+      error is PlatformException && error.code == 'channel-error';
+
   @override
   void initState() {
     super.initState();
     // Handle URL shared while app was closed
     _shareChannel.invokeMethod<String>('getInitialSharedUrl').then((url) {
       if (url != null) _handleSharedUrl(url);
+    }).catchError((error, stackTrace) {
+      if (_isMissingPlugin(error)) {
+        return;
+      }
+      throw error;
     });
     // Handle URL shared while app is running
-    _shareSub = _shareStream.receiveBroadcastStream().listen((url) {
-      if (url is String) _handleSharedUrl(url);
-    });
+    _shareSub = _shareStream.receiveBroadcastStream().listen(
+      (url) {
+        if (url is String) _handleSharedUrl(url);
+      },
+      onError: (error, stackTrace) {
+        if (_isMissingPlugin(error)) {
+          return;
+        }
+        FlutterError.reportError(
+          FlutterErrorDetails(
+            exception: error,
+            stack: stackTrace,
+            library: 'main_shell',
+            context: ErrorDescription('while listening for shared URLs'),
+          ),
+        );
+      },
+    );
   }
 
   @override

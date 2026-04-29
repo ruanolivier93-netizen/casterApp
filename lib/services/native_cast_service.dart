@@ -58,6 +58,10 @@ class NativeCastService {
 
   static Stream<NativeCastState>? _stateStream;
 
+  static bool _isMissingPlugin(Object error) =>
+      error is MissingPluginException ||
+      error is PlatformException && error.code == 'channel-error';
+
   static Stream<NativeCastState> get stateStream {
     return _stateStream ??= _eventChannel
         .receiveBroadcastStream()
@@ -67,15 +71,28 @@ class NativeCastService {
           }
           return null;
         })
+        .handleError((error, stackTrace) {
+          if (_isMissingPlugin(error)) {
+            return;
+          }
+          throw error;
+        })
         .where((event) => event != null)
         .cast<NativeCastState>()
         .asBroadcastStream();
   }
 
   static Future<NativeCastState> getState() async {
-    final raw = await _methodChannel.invokeMethod<Map<Object?, Object?>>('getState');
-    if (raw == null) return NativeCastState.empty;
-    return NativeCastState.fromMap(raw);
+    try {
+      final raw = await _methodChannel.invokeMethod<Map<Object?, Object?>>('getState');
+      if (raw == null) return NativeCastState.empty;
+      return NativeCastState.fromMap(raw);
+    } catch (error) {
+      if (_isMissingPlugin(error)) {
+        return NativeCastState.empty;
+      }
+      rethrow;
+    }
   }
 
   static Future<void> showCastDialog() async {
