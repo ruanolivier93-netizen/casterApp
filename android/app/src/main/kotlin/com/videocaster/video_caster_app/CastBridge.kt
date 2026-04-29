@@ -27,8 +27,16 @@ object CastBridge : MethodChannel.MethodCallHandler, EventChannel.StreamHandler 
     private var eventSink: EventChannel.EventSink? = null
     private var hostActivity: FragmentActivity? = null
     private var remoteMediaClient: RemoteMediaClient? = null
-    private var remoteCallback: RemoteMediaClient.Callback? = null
     private var castContext: CastContext? = null
+
+    private val remoteCallback = object : RemoteMediaClient.Callback() {
+        override fun onStatusUpdated() = emitSnapshot()
+        override fun onMetadataUpdated() = emitSnapshot()
+        override fun onQueueStatusUpdated() = emitSnapshot()
+        override fun onPreloadStatusUpdated() = emitSnapshot()
+        override fun onAdBreakStatusUpdated() = emitSnapshot()
+        override fun onSendingRemoteMediaRequest() = emitState("requesting")
+    }
 
     private val sessionListener = object : SessionManagerListener<CastSession> {
         override fun onSessionStarted(session: CastSession, sessionId: String) = bindSession(session)
@@ -60,7 +68,6 @@ object CastBridge : MethodChannel.MethodCallHandler, EventChannel.StreamHandler 
         if (hostActivity === activity) {
             unregisterSessionListener()
             remoteMediaClient?.unregisterCallback(remoteCallback)
-            remoteCallback = null
             remoteMediaClient = null
             hostActivity = null
         }
@@ -206,14 +213,6 @@ object CastBridge : MethodChannel.MethodCallHandler, EventChannel.StreamHandler 
         }
         remoteMediaClient?.unregisterCallback(remoteCallback)
         remoteMediaClient = client
-        remoteCallback = object : RemoteMediaClient.Callback() {
-            override fun onStatusUpdated() = emitSnapshot()
-            override fun onMetadataUpdated() = emitSnapshot()
-            override fun onQueueStatusUpdated() = emitSnapshot()
-            override fun onPreloadStatusUpdated() = emitSnapshot()
-            override fun onAdBreakStatusUpdated() = emitSnapshot()
-            override fun onSendingRemoteMediaRequest() = emitState("requesting")
-        }
         client?.registerCallback(remoteCallback)
         emit(mapOf(
             "type" to "session_connected",
@@ -224,7 +223,6 @@ object CastBridge : MethodChannel.MethodCallHandler, EventChannel.StreamHandler 
 
     private fun clearSession(reason: String, error: Int) {
         remoteMediaClient?.unregisterCallback(remoteCallback)
-        remoteCallback = null
         remoteMediaClient = null
         emit(mapOf("type" to "session_cleared", "reason" to reason, "error" to error))
         emitSnapshot()
@@ -236,7 +234,7 @@ object CastBridge : MethodChannel.MethodCallHandler, EventChannel.StreamHandler 
     private fun showCastDialog() {
         val activity = hostActivity ?: return
         val context = CastContext.getSharedInstance(activity)
-        val selector = context.mergedSelector
+        val selector = context.mergedSelector ?: return
         val fragmentManager = activity.supportFragmentManager
         val existing = fragmentManager.findFragmentByTag("cast_route_chooser")
         if (existing != null) return
@@ -297,7 +295,7 @@ object CastBridge : MethodChannel.MethodCallHandler, EventChannel.StreamHandler 
 
     private fun idleReasonName(value: Int?): String? = when (value) {
         MediaStatus.IDLE_REASON_NONE -> "none"
-        MediaStatus.IDLE_REASON_CANCELLED -> "cancelled"
+        MediaStatus.IDLE_REASON_CANCELED -> "cancelled"
         MediaStatus.IDLE_REASON_ERROR -> "error"
         MediaStatus.IDLE_REASON_FINISHED -> "finished"
         MediaStatus.IDLE_REASON_INTERRUPTED -> "interrupted"
