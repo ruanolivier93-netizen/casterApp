@@ -3,18 +3,20 @@ package com.videocaster.video_caster_app
 import android.content.Context
 import android.content.Intent
 import android.net.wifi.WifiManager
-import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodChannel
 
-class MainActivity : FlutterActivity() {
+class MainActivity : FlutterFragmentActivity() {
     private var multicastLock: WifiManager.MulticastLock? = null
     private var shareEventSink: EventChannel.EventSink? = null
     private var initialShareUrl: String? = null
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
+
+        CastBridge.attach(this, flutterEngine.dartExecutor.binaryMessenger)
 
         // ── Multicast lock channel ───────────────────────────────────────
         MethodChannel(
@@ -101,6 +103,16 @@ class MainActivity : FlutterActivity() {
         handleShareIntent(intent)
     }
 
+    override fun onResume() {
+        super.onResume()
+        CastBridge.onHostResumed(this)
+    }
+
+    override fun onPause() {
+        CastBridge.onHostPaused(this)
+        super.onPause()
+    }
+
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         handleShareIntent(intent)
@@ -131,6 +143,7 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        CastBridge.detach(this)
         if (multicastLock?.isHeld == true) {
             multicastLock?.release()
         }

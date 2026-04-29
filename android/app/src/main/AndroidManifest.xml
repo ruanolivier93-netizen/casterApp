@@ -25,9 +25,13 @@
 
     <application
         android:label="RL Caster"
-        android:name="${applicationName}"
+        android:name=".MainApplication"
         android:icon="@mipmap/ic_launcher"
+        android:theme="@style/NormalTheme"
         android:usesCleartextTraffic="true">
+        <meta-data
+            android:name="com.google.android.gms.cast.framework.OPTIONS_PROVIDER_CLASS_NAME"
+            android:value="com.videocaster.video_caster_app.CastOptionsProvider" />
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -66,6 +70,11 @@
                 <data android:mimeType="audio/*"/>
             </intent-filter>
         </activity>
+        <activity
+            android:name=".ExpandedControlsActivity"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:theme="@style/CastControlsTheme" />
         <!-- Foreground service keeps the stream proxy alive while casting -->
         <service
             android:name=".CastForegroundService"
@@ -86,6 +95,9 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <intent>
+            <action android:name="android.media.intent.action.MEDIA_PLAY_FROM_SEARCH" />
         </intent>
     </queries>
 </manifest>

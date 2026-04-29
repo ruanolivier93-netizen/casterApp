@@ -94,7 +94,7 @@ class _LocalFilesScreenState extends ConsumerState<LocalFilesScreen> {
                 if (_pickedFiles.isNotEmpty) ...[
                   Row(
                     children: [
-                      Text('Local Videos',
+                      Text('Local videos',
                           style: TextStyle(
                               fontWeight: FontWeight.w600,
                               fontSize: 14,
@@ -123,7 +123,7 @@ class _LocalFilesScreenState extends ConsumerState<LocalFilesScreen> {
                                   fontSize: 12, color: cs.onSurfaceVariant)),
                           trailing: FilledButton.icon(
                             icon: const Icon(Icons.cast, size: 16),
-                            label: const Text('Cast'),
+                            label: const Text('Send'),
                             style: FilledButton.styleFrom(
                               padding: const EdgeInsets.symmetric(
                                   horizontal: 12, vertical: 4),
@@ -151,7 +151,7 @@ class _LocalFilesScreenState extends ConsumerState<LocalFilesScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            Icon(Icons.folder_open, size: 80, color: cs.onSurfaceVariant.withAlpha(80)),
+            Icon(Icons.folder_open, size: 72, color: cs.onSurfaceVariant.withAlpha(80)),
             const SizedBox(height: 16),
             Text('No local videos',
                 style: TextStyle(
@@ -160,7 +160,7 @@ class _LocalFilesScreenState extends ConsumerState<LocalFilesScreen> {
                     color: cs.onSurfaceVariant)),
             const SizedBox(height: 8),
             Text(
-              'Pick videos from your device to cast them to your TV',
+              'Pick videos from your device and send them to your TV.',
               textAlign: TextAlign.center,
               style: TextStyle(color: cs.onSurfaceVariant),
             ),

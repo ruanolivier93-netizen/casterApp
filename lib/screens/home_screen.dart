@@ -9,9 +9,11 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:path_provider/path_provider.dart';
 import '../providers/app_state.dart';
 import '../providers/bookmarks_history.dart';
+import '../providers/native_cast_provider.dart';
 import '../providers/privacy_telemetry.dart';
 import '../providers/queue_provider.dart';
 import '../services/subtitle_service.dart';
+import '../services/native_cast_service.dart';
 import '../models/video_info.dart';
 import '../models/dlna_device.dart';
 
@@ -56,8 +58,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
   Widget build(BuildContext context) {
     final videoState = ref.watch(videoProvider);
     final devicesState = ref.watch(devicesProvider);
+    final nativeCastState = ref.watch(nativeCastProvider);
     final selectedFormat = ref.watch(selectedFormatProvider);
     final selectedDevice = ref.watch(selectedDeviceProvider);
+    final effectiveCastDevice = selectedDevice ??
+        (nativeCastState.connected
+            ? DlnaDevice(
+                protocol: CastProtocol.chromecast,
+                name: nativeCastState.deviceName ?? 'Chromecast',
+                manufacturer: 'Google Cast',
+                location: 'cast://active-session',
+                controlUrl: '',
+              )
+            : null);
     final castState = ref.watch(castProvider);
     final isCasting = castState is CastPlaying;
     final cs = Theme.of(context).colorScheme;
@@ -83,13 +96,19 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        leading: const Padding(
-          padding: EdgeInsets.all(12.0),
-          child: Icon(Icons.cast, size: 24),
-        ),
-        title: const Text('Ruan Lelanie Caster'),
-        centerTitle: false,
+        title: const Text('Cast'),
         actions: [
+          IconButton(
+            icon: Icon(
+              nativeCastState.connected
+                  ? Icons.cast_connected_rounded
+                  : Icons.cast_outlined,
+            ),
+            tooltip: nativeCastState.connected
+                ? 'Connected to ${nativeCastState.deviceName ?? 'Chromecast'}'
+                : 'Connect Chromecast',
+            onPressed: () => ref.read(nativeCastProvider.notifier).showDialog(),
+          ),
           IconButton(
             icon: const Icon(Icons.settings_outlined),
             tooltip: 'Settings',
@@ -139,7 +158,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                   curve: Curves.easeInOut,
                   child: videoState is VideoLoaded &&
                           selectedFormat != null &&
-                          selectedDevice != null &&
+                          effectiveCastDevice != null &&
                           castState is! CastPlaying &&
                           castState is! CastPreparing
                       ? Padding(
@@ -147,7 +166,7 @@ class _HomeScreenState extends ConsumerState<HomeScreen> {
                           child: _CastNowButton(
                             videoState: videoState,
                             format: selectedFormat,
-                            device: selectedDevice,
+                            device: effectiveCastDevice,
                           ),
                         )
                       : const SizedBox.shrink(),
@@ -508,6 +527,7 @@ class _DeviceSection extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final cs = Theme.of(context).colorScheme;
     final lastDeviceLocation = ref.watch(lastDeviceProvider);
+    final nativeCastState = ref.watch(nativeCastProvider);
 
     // Collect available devices from both scanning and result states.
     final List<DlnaDevice> devices;
@@ -573,6 +593,27 @@ class _DeviceSection extends ConsumerWidget {
               ),
           ],
         ),
+        if (nativeCastState.connected) ...[
+          const SizedBox(height: 6),
+          ListTile(
+            dense: true,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(10),
+              side: BorderSide(color: cs.primary, width: 1.2),
+            ),
+            tileColor: cs.primaryContainer.withAlpha(70),
+            leading: Icon(Icons.cast_connected_rounded,
+                color: cs.primary, size: 22),
+            title: Text(
+              nativeCastState.deviceName ?? 'Chromecast connected',
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+            ),
+            subtitle: const Text(
+              'Google Cast session active. Use the Cast button to switch devices.',
+              style: TextStyle(fontSize: 11),
+            ),
+          ),
+        ],
         const SizedBox(height: 6),
         if (devices.isEmpty && !isScanning && devicesState is! DevicesIdle)
           Padding(
@@ -580,7 +621,9 @@ class _DeviceSection extends ConsumerWidget {
             child: Column(
               children: [
                 Text(
-                  'No TVs found. Make sure your TV is on and connected to the same WiFi.',
+                  nativeCastState.connected
+                      ? 'No DLNA TVs found. Your Google Cast device is already connected above.'
+                      : 'No TVs found. Make sure your TV is on and connected to the same WiFi.',
                   style: TextStyle(color: cs.onSurfaceVariant, fontSize: 13),
                 ),
                 const SizedBox(height: 8),
@@ -692,6 +735,8 @@ class _CastNowButton extends ConsumerWidget {
                   title: videoState.info.title,
                   routeThroughPhone: settings.routeThroughPhone,
                   subtitleSrt: sub?.srtContent,
+              subtitleLanguage: sub?.language,
+              subtitleLabel: sub?.label,
                   durationSeconds: videoState.info.durationSeconds,
                 );
           },
@@ -751,8 +796,9 @@ class _CastControlsState extends ConsumerState<_CastControls> {
     setState(() => _volumeLoading = true);
     try {
       if (device.protocol == CastProtocol.chromecast) {
+        final v = await NativeCastService.getVolume();
         _volumeFetched = true;
-        if (mounted) setState(() => _volume ??= 50);
+        if (mounted) setState(() => _volume = (v ?? 0.5) * 100);
       } else {
         final v = await ref.read(dlnaServiceProvider).getVolume(device);
         _volumeFetched = true;
@@ -766,7 +812,7 @@ class _CastControlsState extends ConsumerState<_CastControls> {
   Future<void> _setVolume(DlnaDevice device, double v) async {
     setState(() => _volume = v);
     if (device.protocol == CastProtocol.chromecast) {
-      await ref.read(chromecastServiceProvider).setVolume(v / 100);
+      await NativeCastService.setVolume(v / 100);
     } else {
       await ref.read(dlnaServiceProvider).setVolume(device, v.round());
     }
@@ -1683,10 +1729,10 @@ class _SettingsSheetState extends ConsumerState<_SettingsSheet> {
           const SizedBox(height: 16),
           SwitchListTile(
             contentPadding: EdgeInsets.zero,
-            title: const Text('Route through phone'),
+            title: const Text('Prefer phone relay'),
             subtitle: const Text(
-              'When ON, the phone proxies the video stream to the TV. '
-              'Recommended for YouTube and sites that restrict direct TV access.',
+              'When ON, the phone relays the stream to the TV when possible. '
+              'If OFF, the app still relays automatically when direct playback is likely to fail.',
             ),
             value: settings.routeThroughPhone,
             onChanged: (_) => ref.read(settingsProvider.notifier).toggle(),

@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:wakelock_plus/wakelock_plus.dart';
 import '../models/video_info.dart';
@@ -8,18 +10,18 @@ import '../models/dlna_device.dart';
 import '../services/video_extractor.dart';
 import '../services/dlna_service.dart';
 import '../services/stream_proxy.dart';
-import '../services/chromecast_service.dart';
 import '../services/cast_background_service.dart';
 import '../services/subtitle_service.dart';
 import '../services/download_service.dart';
+import '../services/native_cast_service.dart';
 import '../providers/queue_provider.dart';
+import 'native_cast_provider.dart';
 import 'privacy_telemetry.dart';
 
 // ── Singleton services ────────────────────────────────────────────────────────────────────
 
 final videoExtractorProvider = Provider((_) => VideoExtractorService());
 final dlnaServiceProvider = Provider((_) => DlnaService());
-final chromecastServiceProvider = Provider((_) => ChromecastService());
 final streamProxyProvider = Provider((_) => StreamProxyService());
 final subtitleServiceProvider = Provider((_) => SubtitleService());
 final downloadServiceProvider = Provider((_) => DownloadService());
@@ -189,11 +191,11 @@ class DevicesError extends DevicesState {
 }
 
 class DevicesNotifier extends StateNotifier<DevicesState> {
-  DevicesNotifier(this._dlna, this._chromecast) : super(const DevicesIdle());
+  DevicesNotifier(this._dlna) : super(const DevicesIdle());
   final DlnaService _dlna;
-  final ChromecastService _chromecast;
 
-  /// Stream-based scan: DLNA + Chromecast in parallel, devices appear live.
+  /// Stream-based scan for DLNA renderers only.
+  /// Google Cast discovery is handled by the native Cast SDK dialog.
   Future<void> scan() async {
     state = const DevicesScanning();
     try {
@@ -209,23 +211,9 @@ class DevicesNotifier extends StateNotifier<DevicesState> {
         }
       }
 
-      // Run DLNA and Chromecast discovery in parallel
-      await Future.wait([
-        (() async {
-          await for (final device in _dlna.discoverStream()) {
-            addDevice(device);
-          }
-        })(),
-        (() async {
-          try {
-            await for (final device in _chromecast.discover()) {
-              addDevice(device);
-            }
-          } catch (_) {
-            // mDNS may fail on some networks — don't block DLNA results
-          }
-        })(),
-      ]);
+      await for (final device in _dlna.discoverStream()) {
+        addDevice(device);
+      }
 
       state = DevicesResult(found);
     } catch (e) {
@@ -235,10 +223,7 @@ class DevicesNotifier extends StateNotifier<DevicesState> {
 }
 
 final devicesProvider = StateNotifierProvider<DevicesNotifier, DevicesState>(
-  (ref) => DevicesNotifier(
-    ref.watch(dlnaServiceProvider),
-    ref.watch(chromecastServiceProvider),
-  ),
+  (ref) => DevicesNotifier(ref.watch(dlnaServiceProvider)),
 );
 
 // ── Cast state ────────────────────────────────────────────────────────────────
@@ -282,11 +267,12 @@ class CastError extends CastState {
 }
 
 class CastNotifier extends StateNotifier<CastState> {
-  CastNotifier(this._dlna, this._chromecast, this._proxy, this._telemetry,
+  CastNotifier(this._dlna, this._proxy, this._telemetry,
       {this.onVideoFinished})
-      : super(const CastIdle());
+      : super(const CastIdle()) {
+    _nativeCastSub = NativeCastService.stateStream.listen(_handleNativeCastState);
+  }
   final DlnaService _dlna;
-  final ChromecastService _chromecast;
   final StreamProxyService _proxy;
   final TelemetryNotifier _telemetry;
 
@@ -296,6 +282,7 @@ class CastNotifier extends StateNotifier<CastState> {
 
   Timer? _progressTimer;
   Timer? _sleepTimer;
+  StreamSubscription<NativeCastState>? _nativeCastSub;
   Duration _position = Duration.zero;
   Duration _totalDuration = Duration.zero;
   int _pollFailures = 0;
@@ -318,6 +305,8 @@ class CastNotifier extends StateNotifier<CastState> {
     required String title,
     required bool routeThroughPhone,
     String? subtitleSrt,
+    String? subtitleLanguage,
+    String? subtitleLabel,
     int? durationSeconds,
     String? refererUrl,
   }) async {
@@ -331,12 +320,21 @@ class CastNotifier extends StateNotifier<CastState> {
           subtitleSrt: subtitleSrt,
           refererUrl: refererUrl,
         );
+
+    // DASH is more reliable as a direct receiver load than through the current
+    // phone relay path, because the relay rewrites HLS manifests but does not
+    // yet provide full DASH segment-template rewriting.
+    if (format.url.toLowerCase().split('?').first.endsWith('.mpd')) {
+      usePhoneProxy = false;
+    }
+
     String? directCastError;
 
     for (var attempt = 0; attempt < 2; attempt++) {
       try {
         String castUrl;
         String? subtitleUrl;
+        String? castSubtitleUrl;
         String? contentType;
 
         if (usePhoneProxy) {
@@ -351,6 +349,7 @@ class CastNotifier extends StateNotifier<CastState> {
           }
           castUrl = '$baseUrl/stream';
           if (subtitleSrt != null) subtitleUrl = '$baseUrl/subtitle.srt';
+          if (subtitleSrt != null) castSubtitleUrl = _proxy.subtitleVttEndpoint;
           // Use the MIME type from the original URL, not the proxy URL.
           contentType = _proxy.originalMimeType;
         } else {
@@ -368,14 +367,20 @@ class CastNotifier extends StateNotifier<CastState> {
         }
 
         if (device.protocol == CastProtocol.chromecast) {
-          // ── Chromecast flow ──
-          await _chromecast.connect(device);
-          await _chromecast.loadMedia(
+          // ── Chromecast flow via the official Android Cast sender SDK ──
+          final nativeState = await NativeCastService.getState();
+          if (!nativeState.connected) {
+            throw Exception('Connect to a Chromecast from the Cast button first');
+          }
+          await NativeCastService.loadMedia(
             url: castUrl,
             title: title,
+            subtitle: null,
+            subtitleLanguage: subtitleLanguage,
+            subtitleLabel: subtitleLabel,
             contentType: contentType ?? _guessChromecastMime(format.url),
-            subtitleUrl: subtitleUrl,
-            durationSeconds: effectiveDuration,
+            durationMs: effectiveDuration != null ? effectiveDuration * 1000 : null,
+            subtitleUrl: castSubtitleUrl,
           );
         } else {
           // ── DLNA flow ──
@@ -401,6 +406,9 @@ class CastNotifier extends StateNotifier<CastState> {
           },
         );
         await WakelockPlus.enable();
+        if (usePhoneProxy) {
+          await _ensureRelayNotificationPermission();
+        }
         await CastBackgroundService.start('Casting to ${device.name}');
         _castStartTime = DateTime.now();
         _lastSeekAt = null;
@@ -410,9 +418,6 @@ class CastNotifier extends StateNotifier<CastState> {
         return;
       } catch (e) {
         await _proxy.stop();
-        if (device.protocol == CastProtocol.chromecast) {
-          await _chromecast.disconnect();
-        }
 
         // If direct cast fails, retry once through the phone proxy automatically.
         if (!usePhoneProxy && attempt == 0) {
@@ -468,9 +473,9 @@ class CastNotifier extends StateNotifier<CastState> {
 
     final lower = streamUrl.toLowerCase();
 
-    // Adaptive streams and signed URLs are frequently denied when fetched
-    // directly by TVs (missing cookies/referer/header constraints).
-    if (lower.contains('.m3u8') || lower.endsWith('.mpd')) {
+    // HLS and signed URLs are frequently denied when fetched directly by TVs
+    // (missing cookies/referer/header constraints).
+    if (lower.contains('.m3u8')) {
       return true;
     }
 
@@ -505,11 +510,7 @@ class CastNotifier extends StateNotifier<CastState> {
     if (s is! CastPlaying) return;
     try {
       if (s.device.protocol == CastProtocol.chromecast) {
-        if (s.isPaused) {
-          await _chromecast.play();
-        } else {
-          await _chromecast.pause();
-        }
+        await NativeCastService.togglePlayback();
       } else {
         if (s.isPaused) {
           await _dlna.play(s.device);
@@ -552,7 +553,7 @@ class CastNotifier extends StateNotifier<CastState> {
         _pendingSeekTarget = null;
         try {
           if (s.device.protocol == CastProtocol.chromecast) {
-            await _chromecast.seek(target);
+            await NativeCastService.seekTo(target.inMilliseconds);
           } else {
             await _dlna.seek(s.device, target);
           }
@@ -592,8 +593,7 @@ class CastNotifier extends StateNotifier<CastState> {
     if (s is CastPlaying) {
       try {
         if (s.device.protocol == CastProtocol.chromecast) {
-          await _chromecast.stop();
-          await _chromecast.disconnect();
+          await NativeCastService.stop();
         } else {
           await _dlna.stop(s.device);
         }
@@ -632,18 +632,18 @@ class CastNotifier extends StateNotifier<CastState> {
 
       try {
         if (device.protocol == CastProtocol.chromecast) {
-          final status = await _chromecast.getMediaStatus();
-          if (status == null) return;
+          final status = await NativeCastService.getState();
+          if (!status.connected) return;
           _pollFailures = 0;
-          _position = status.position;
+          _position = Duration(milliseconds: status.positionMs);
           // Only update duration if the TV/Chromecast reports a positive value.
           // Otherwise keep the probed duration we pre-set.
-          if (status.duration > Duration.zero) {
-            _totalDuration = status.duration;
+          if (status.durationMs > 0) {
+            _totalDuration = Duration(milliseconds: status.durationMs);
           }
 
-          switch (status.state) {
-            case 'IDLE':
+          switch (status.playerState) {
+            case 'idle':
               if (!inGracePeriod &&
                   !inSeekStabilizationWindow &&
                   _hasEverPlayed) {
@@ -655,15 +655,16 @@ class CastNotifier extends StateNotifier<CastState> {
                   await _onNaturalStop();
                 }
               }
-            case 'PAUSED':
+            case 'paused':
               _hasEverPlayed = true;
               _consecutiveStoppedPolls = 0;
               final s = state;
               if (s is CastPlaying && !s.isPaused) {
                 state = s.copyWith(isPaused: true);
               }
-            case 'PLAYING':
-            case 'BUFFERING':
+            case 'playing':
+            case 'buffering':
+            case 'loading':
               _hasEverPlayed = true;
               _consecutiveStoppedPolls = 0;
               final s = state;
@@ -728,6 +729,32 @@ class CastNotifier extends StateNotifier<CastState> {
     });
   }
 
+  void _handleNativeCastState(NativeCastState next) {
+    final current = state;
+    if (current is! CastPlaying || current.device.protocol != CastProtocol.chromecast) {
+      return;
+    }
+
+    if (!next.connected) {
+      state = const CastIdle();
+      _position = Duration.zero;
+      _totalDuration = Duration.zero;
+      return;
+    }
+
+    _position = Duration(milliseconds: next.positionMs);
+    if (next.durationMs > 0) {
+      _totalDuration = Duration(milliseconds: next.durationMs);
+    }
+
+    final shouldBePaused = next.isPaused;
+    if (current.isPaused != shouldBePaused) {
+      state = current.copyWith(isPaused: shouldBePaused);
+    } else {
+      _touchState();
+    }
+  }
+
   /// Called when the video ends naturally. Tries auto-play-next, else stops.
   Future<void> _onNaturalStop() async {
     if (onVideoFinished != null) {
@@ -760,21 +787,45 @@ class CastNotifier extends StateNotifier<CastState> {
     final lower = url.toLowerCase().split('?').first;
     if (lower.contains('.m3u8')) return 'application/x-mpegurl';
     if (lower.endsWith('.mpd')) return 'application/dash+xml';
+    if (lower.endsWith('.mp4') || lower.endsWith('.m4v')) return 'video/mp4';
     if (lower.endsWith('.webm')) return 'video/webm';
     if (lower.endsWith('.mkv')) return 'video/x-matroska';
     if (lower.endsWith('.avi')) return 'video/x-msvideo';
     if (lower.endsWith('.mov')) return 'video/quicktime';
     if (lower.endsWith('.ts')) return 'video/mp2t';
+    if (lower.endsWith('.flv')) return 'video/x-flv';
+    if (lower.endsWith('.3gp')) return 'video/3gpp';
+    if (lower.endsWith('.wmv')) return 'video/x-ms-wmv';
+    if (lower.endsWith('.ogv') || lower.endsWith('.ogg')) return 'video/ogg';
     if (lower.endsWith('.mp3')) return 'audio/mpeg';
     if (lower.endsWith('.m4a') || lower.endsWith('.aac')) return 'audio/mp4';
     if (lower.endsWith('.flac')) return 'audio/flac';
+    if (lower.endsWith('.wav')) return 'audio/wav';
+    if (lower.endsWith('.opus')) return 'audio/opus';
     return 'video/mp4';
+  }
+
+  Future<void> _ensureRelayNotificationPermission() async {
+    if (!Platform.isAndroid) return;
+
+    final status = await Permission.notification.status;
+    if (status.isGranted || status.isPermanentlyDenied) {
+      return;
+    }
+
+    try {
+      await Permission.notification.request();
+    } catch (_) {
+      // The relay can still run without a granted drawer notification on
+      // Android 13+, so permission failures should never block casting.
+    }
   }
 
   @override
   void dispose() {
     _progressTimer?.cancel();
     _sleepTimer?.cancel();
+    _nativeCastSub?.cancel();
     super.dispose();
   }
 }
@@ -784,7 +835,6 @@ final castProvider = StateNotifierProvider<CastNotifier, CastState>(
     late final CastNotifier notifier;
     notifier = CastNotifier(
       ref.watch(dlnaServiceProvider),
-      ref.watch(chromecastServiceProvider),
       ref.watch(streamProxyProvider),
       ref.watch(telemetryProvider.notifier),
       onVideoFinished: () async {
@@ -796,7 +846,17 @@ final castProvider = StateNotifierProvider<CastNotifier, CastState>(
           try {
             final info = await extractor.extract(next.url);
             if (info.formats.isNotEmpty) {
-              final device = ref.read(selectedDeviceProvider);
+              final nativeCastState = ref.read(nativeCastProvider);
+              final device = ref.read(selectedDeviceProvider) ??
+                  (nativeCastState.connected
+                      ? DlnaDevice(
+                          protocol: CastProtocol.chromecast,
+                          name: nativeCastState.deviceName ?? 'Chromecast',
+                          manufacturer: 'Google Cast',
+                          location: 'cast://active-session',
+                          controlUrl: '',
+                        )
+                      : null);
               final settings = ref.read(settingsProvider);
               if (device != null) {
                 await notifier.cast(

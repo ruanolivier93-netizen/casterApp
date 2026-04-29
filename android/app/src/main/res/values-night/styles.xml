@@ -15,4 +15,31 @@
     <style name="NormalTheme" parent="@android:style/Theme.Black.NoTitleBar">
         <item name="android:windowBackground">?android:colorBackground</item>
     </style>
+
+    <style name="CastControlsTheme" parent="Theme.AppCompat.DayNight.NoActionBar">
+        <item name="mediaRouteTheme">@style/MediaRouterTheme.RLCaster</item>
+        <item name="castMiniControllerStyle">@style/RLCasterMiniController</item>
+        <item name="castExpandedControllerStyle">@style/RLCasterExpandedController</item>
+    </style>
+
+    <style name="MediaRouterTheme.RLCaster" parent="Theme.MediaRouter">
+        <item name="mediaRouteButtonStyle">@style/Widget.RLCaster.MediaRouteButton</item>
+    </style>
+
+    <style name="Widget.RLCaster.MediaRouteButton" parent="Widget.MediaRouter.Dark.MediaRouteButton">
+        <item name="mediaRouteButtonTint">#FFFFFFFF</item>
+    </style>
+
+    <style name="RLCasterMiniController" parent="CastMiniController">
+        <item name="castControlButtons">@array/cast_mini_controller_control_buttons</item>
+        <item name="castBackground">#FF111827</item>
+        <item name="castTitleTextAppearance">@style/TextAppearance.AppCompat.Subhead</item>
+        <item name="castSubtitleTextAppearance">@style/TextAppearance.AppCompat.Caption</item>
+        <item name="castShowImageThumbnail">true</item>
+    </style>
+
+    <style name="RLCasterExpandedController" parent="CastExpandedController">
+        <item name="castControlButtons">@array/cast_expanded_controller_control_buttons</item>
+        <item name="castButtonColor">#FFFFFFFF</item>
+    </style>
 </resources>

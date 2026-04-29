@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
+import 'package:xml/xml.dart';
 
 /// Runs a local HTTP server that proxies the video stream to the TV.
 /// When "route through phone" is ON, the TV fetches from this server
@@ -106,6 +107,11 @@ class StreamProxyService {
   /// The subtitle URL the TV should fetch (null if no subs loaded).
   String? get subtitleEndpoint => _subtitleSrt != null && _server != null
       ? 'http://${_server!.address.host}:${_server!.port}/subtitle.srt'
+      : null;
+
+    /// WebVTT subtitle endpoint for Cast receivers.
+    String? get subtitleVttEndpoint => _subtitleSrt != null && _server != null
+      ? 'http://${_server!.address.host}:${_server!.port}/subtitle.vtt'
       : null;
 
   /// Probes the upstream stream to learn Content-Length and duration.
@@ -244,6 +250,16 @@ class StreamProxyService {
         return;
       }
 
+      if (path == '/subtitle.vtt' && _subtitleSrt != null) {
+        req.response
+          ..statusCode = 200
+          ..headers.set('Content-Type', 'text/vtt; charset=utf-8')
+          ..headers.set('Access-Control-Allow-Origin', '*')
+          ..write(_toWebVtt(_subtitleSrt!));
+        await req.response.close();
+        return;
+      }
+
       // ── Proxy endpoint — proxies arbitrary URLs (used for HLS segments,
       //    variant playlists, encryption keys, etc.) ──────────────────────
       if (path == '/proxy') {
@@ -341,9 +357,8 @@ class StreamProxyService {
   }
 
   /// Proxies a remote HTTP stream to the local TV.
-  /// If the response is an HLS manifest (.m3u8), segment/variant URLs are
-  /// rewritten to go through this proxy so the TV never contacts the CDN
-  /// directly (which would fail without proper headers/cookies).
+  /// If the response is an HLS or DASH manifest, media URLs are rewritten to go
+  /// through this proxy so the TV never contacts the CDN directly.
   ///
   /// Implements **auto-resume**: many CDNs (YouTube, lookmovie, etc.) throttle
   /// connections by sending an initial burst of data (~7-10 seconds) and then
@@ -398,10 +413,14 @@ class StreamProxyService {
       }
       if (upstreamResp == null) throw lastError ?? Exception('Upstream fetch failed');
 
-      // ── HLS manifest? Rewrite URLs so everything goes through the proxy ──
+      // ── Adaptive manifest? Rewrite URLs so everything goes through the proxy ──
       final ct = upstreamResp.headers['content-type'] ?? '';
       if (!isHead && (_isHlsUrl(streamUrl) || _isHlsContentType(ct))) {
         await _serveRewrittenHls(req, upstreamResp, streamUrl);
+        return;
+      }
+      if (!isHead && (_isDashUrl(streamUrl) || _isDashContentType(ct))) {
+        await _serveRewrittenDash(req, upstreamResp, streamUrl);
         return;
       }
 
@@ -557,6 +576,17 @@ class StreamProxyService {
     return lower.contains('mpegurl') || lower.contains('x-mpegurl');
   }
 
+  bool _isDashUrl(String url) {
+    final lower = url.toLowerCase().split('?').first;
+    return lower.endsWith('.mpd');
+  }
+
+  bool _isDashContentType(String ct) {
+    final lower = ct.toLowerCase();
+    return lower.contains('application/dash+xml') ||
+        lower.contains('application/xml+dash');
+  }
+
   /// Reads the full HLS manifest body, rewrites every URL to go through our
   /// /proxy endpoint, and serves the result to the TV.
   Future<void> _serveRewrittenHls(
@@ -569,6 +599,27 @@ class StreamProxyService {
       req.response
         ..statusCode = 200
         ..headers.set('Content-Type', 'application/x-mpegURL; charset=utf-8')
+        ..headers.set('Access-Control-Allow-Origin', '*')
+        ..write(rewritten);
+      await req.response.close();
+    } catch (_) {
+      try {
+        req.response.statusCode = 502;
+        await req.response.close();
+      } catch (_) {}
+    }
+  }
+
+  Future<void> _serveRewrittenDash(
+      HttpRequest req, http.StreamedResponse resp, String manifestUrl) async {
+    try {
+      final bodyBytes = await resp.stream.toBytes();
+      final manifest = utf8.decode(bodyBytes, allowMalformed: true);
+      final rewritten = _rewriteDashManifest(manifest, manifestUrl);
+
+      req.response
+        ..statusCode = 200
+        ..headers.set('Content-Type', 'application/dash+xml; charset=utf-8')
         ..headers.set('Access-Control-Allow-Origin', '*')
         ..write(rewritten);
       await req.response.close();
@@ -603,13 +654,94 @@ class StreamProxyService {
     return buf.toString();
   }
 
+  String _rewriteDashManifest(String manifest, String manifestUrl) {
+    final document = XmlDocument.parse(manifest);
+    final manifestUri = Uri.parse(manifestUrl);
+    final root = document.rootElement;
+    _rewriteDashElement(root, manifestUri);
+    return document.toXmlString(pretty: false);
+  }
+
+  void _rewriteDashElement(XmlElement element, Uri inheritedBase) {
+    final effectiveBase = _effectiveDashBase(element, inheritedBase);
+
+    _rewriteDashAttributeIfPresent(element, 'media', effectiveBase,
+        preserveTemplateTokens: true);
+    _rewriteDashAttributeIfPresent(element, 'initialization', effectiveBase,
+        preserveTemplateTokens: true);
+    _rewriteDashAttributeIfPresent(element, 'sourceURL', effectiveBase);
+    _rewriteDashAttributeIfPresent(element, 'index', effectiveBase,
+        preserveTemplateTokens: true);
+    _rewriteDashAttributeIfPresent(element, 'xlink:href', effectiveBase);
+    _rewriteDashAttributeIfPresent(element, 'href', effectiveBase);
+    _rewriteDashAttributeIfPresent(element, 'Location', effectiveBase);
+
+    for (final baseUrl in element.children.whereType<XmlElement>()) {
+      if (baseUrl.name.local != 'BaseURL') continue;
+      final original = baseUrl.innerText.trim();
+      if (original.isEmpty) continue;
+      final resolved = inheritedBase.resolve(original).toString();
+      baseUrl.children
+        ..clear()
+        ..add(XmlText(_buildProxyUrl(resolved)));
+    }
+
+    for (final child in element.children.whereType<XmlElement>()) {
+      _rewriteDashElement(child, effectiveBase);
+    }
+  }
+
+  Uri _effectiveDashBase(XmlElement element, Uri inheritedBase) {
+    for (final child in element.children.whereType<XmlElement>()) {
+      if (child.name.local != 'BaseURL') continue;
+      final text = child.innerText.trim();
+      if (text.isEmpty) continue;
+      return inheritedBase.resolve(text);
+    }
+    return inheritedBase;
+  }
+
+  void _rewriteDashAttributeIfPresent(
+    XmlElement element,
+    String attributeName,
+    Uri baseUri, {
+    bool preserveTemplateTokens = false,
+  }) {
+    final attribute = element.getAttributeNode(attributeName) ??
+        element.attributes.where((attr) => attr.name.qualified == attributeName).firstOrNull;
+    if (attribute == null) return;
+
+    final value = attribute.value.trim();
+    if (value.isEmpty) return;
+
+    final resolved = baseUri.resolve(value).toString();
+    attribute.value = _buildProxyUrl(
+      resolved,
+      preserveTemplateTokens: preserveTemplateTokens,
+    );
+  }
+
   /// Rewrites URI="..." attributes inside HLS tags (e.g. #EXT-X-KEY, #EXT-X-MAP).
   String _rewriteHlsTagUris(String line, Uri baseUri) {
     return line.replaceAllMapped(RegExp(r'URI="([^"]*)"'), (m) {
       final uri = m.group(1)!;
       final resolved = baseUri.resolve(uri).toString();
-      return 'URI="$_baseUrl/proxy?url=${Uri.encodeComponent(resolved)}"';
+      return 'URI="${_buildProxyUrl(resolved)}"';
     });
+  }
+
+  String _buildProxyUrl(String resolvedUrl, {bool preserveTemplateTokens = true}) {
+    return '$_baseUrl/proxy?url=${_encodeProxyUrl(resolvedUrl, preserveTemplateTokens: preserveTemplateTokens)}';
+  }
+
+  String _encodeProxyUrl(String url, {bool preserveTemplateTokens = true}) {
+    final encoded = Uri.encodeComponent(url);
+    if (!preserveTemplateTokens) return encoded;
+
+    return encoded
+        .replaceAll('%24', r'$')
+        .replaceAll('%7B', '{')
+        .replaceAll('%7D', '}');
   }
 
   Future<void> stop() async {
@@ -625,6 +757,28 @@ class StreamProxyService {
     _probedDurationSeconds = null;
     _client?.close();
     _client = null;
+  }
+
+  String _toWebVtt(String srt) {
+    final normalized = srt.replaceAll('\r\n', '\n').replaceAll('\r', '\n');
+    final lines = normalized.split('\n');
+    final out = StringBuffer('WEBVTT\n\n');
+    final timecode = RegExp(
+      r'^(\d{2}:\d{2}:\d{2}),(\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2}),(\d{3})(.*)$',
+    );
+
+    for (final line in lines) {
+      final match = timecode.firstMatch(line.trim());
+      if (match != null) {
+        out.writeln(
+          '${match.group(1)}.${match.group(2)} --> ${match.group(3)}.${match.group(4)}${match.group(5) ?? ''}',
+        );
+      } else {
+        out.writeln(line);
+      }
+    }
+
+    return out.toString();
   }
 
   /// Extracts the total expected body length from an upstream response.

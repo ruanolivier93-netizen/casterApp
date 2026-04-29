@@ -7,8 +7,10 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../services/ad_blocker.dart';
+import '../services/native_cast_service.dart';
 import '../providers/bookmarks_history.dart';
 import '../providers/app_state.dart';
+import '../providers/native_cast_provider.dart';
 import '../providers/privacy_telemetry.dart';
 import '../models/dlna_device.dart';
 
@@ -245,11 +247,20 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   // ── Content blocker builder ───────────────────────────────────────────────
 
   List<ContentBlocker> _buildContentBlockers() {
+    const blockedResourceTypes = <ContentBlockerTriggerResourceType>[
+      ContentBlockerTriggerResourceType.SCRIPT,
+      ContentBlockerTriggerResourceType.STYLE_SHEET,
+      ContentBlockerTriggerResourceType.IMAGE,
+      ContentBlockerTriggerResourceType.FONT,
+      ContentBlockerTriggerResourceType.SVG_DOCUMENT,
+    ];
+
     final blockers = <ContentBlocker>[];
     for (final domain in AdBlocker.blockedDomains) {
       blockers.add(ContentBlocker(
         trigger: ContentBlockerTrigger(
           urlFilter: '^https?://([^/]+\\.)?${RegExp.escape(domain)}([/:].*)?',
+          resourceType: blockedResourceTypes,
         ),
         action: ContentBlockerAction(type: ContentBlockerActionType.BLOCK),
       ));
@@ -257,7 +268,14 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     return blockers;
   }
 
-  List<UserScript> _initialScripts(bool adBlockEnabled) {
+  List<ContentBlocker> _contentBlockersForPage(String pageUrl, bool enabled) {
+    if (!enabled || AdBlocker.isPlaybackSensitiveUrl(pageUrl)) {
+      return const [];
+    }
+    return _contentBlockers;
+  }
+
+  List<UserScript> _initialScripts(bool adBlockEnabled, String pageUrl) {
     // Strategy (Brave / AdGuard / uBO Lite mobile model):
     //   1. Network-level URL blocking via native ContentBlocker (handled in
     //      `_buildContentBlockers()` and applied through InAppWebViewSettings).
@@ -272,6 +290,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     // overriding `window.open`, `addEventListener`, `setTimeout` strings, or
     // walking the DOM with `getComputedStyle` reliably breaks legitimate
     // video players (HLS.js, JW Player, video.js, custom HTML5 wrappers).
+    final lightMode = AdBlocker.isPlaybackSensitiveUrl(pageUrl);
     final scripts = <UserScript>[
       UserScript(
         source: AdBlocker.videoDetectorScript,
@@ -285,10 +304,11 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
           source: _bridgeScript,
           injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
         ),
-        UserScript(
-          source: _cssInjectionScript,
-          injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
-        ),
+        if (!lightMode)
+          UserScript(
+            source: _cssInjectionScript,
+            injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
+          ),
       ]);
     }
 
@@ -320,24 +340,37 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
 ''';
   }
 
-  Future<void> _injectAdBlockScripts(InAppWebViewController controller) async {
+  Future<void> _injectAdBlockScripts(
+    InAppWebViewController controller,
+    String pageUrl,
+  ) async {
     // Re-inject the lightweight layers (bridge + CSS) when ad-block is toggled
     // on at runtime. Heavy DOM/event-intercepting JS is intentionally NOT
     // injected — see `_initialScripts()` for rationale.
     await controller.evaluateJavascript(source: _bridgeScript);
-    await controller.evaluateJavascript(source: _cssInjectionScript);
+    if (!AdBlocker.isPlaybackSensitiveUrl(pageUrl)) {
+      await controller.evaluateJavascript(source: _cssInjectionScript);
+    }
     await controller.evaluateJavascript(source: AdBlocker.videoDetectorScript);
+  }
+
+  Future<void> _applyBlockingModeForTab(
+    InAppWebViewController controller,
+    String pageUrl,
+    bool enabled,
+  ) async {
+    await controller.setSettings(
+      settings: InAppWebViewSettings(
+        contentBlockers: _contentBlockersForPage(pageUrl, enabled),
+      ),
+    );
   }
 
   Future<void> _applyAdBlockSettingsToTabs(bool enabled) async {
     for (final tab in _tabs) {
       final controller = tab.controller;
       if (controller == null) continue;
-      await controller.setSettings(
-        settings: InAppWebViewSettings(
-          contentBlockers: enabled ? _contentBlockers : [],
-        ),
-      );
+      await _applyBlockingModeForTab(controller, tab.url, enabled);
       await controller.reload();
     }
   }
@@ -345,8 +378,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
   bool _shouldBlockNavigation(_BrowserTab tab, String url) {
     final settings = ref.read(settingsProvider);
     if (!settings.adBlockEnabled) return false;
-    final blocked =
-        AdBlocker.shouldBlock(url) || AdBlocker.isPopupOrRedirect(url);
+    final blocked = AdBlocker.shouldBlockNavigation(url);
     if (blocked) {
       _onAdBlocked(tab, url);
     }
@@ -370,7 +402,8 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
 
     return InAppWebView(
       initialUrlRequest: URLRequest(url: WebUri(initialUrl)),
-      initialUserScripts: UnmodifiableListView(_initialScripts(adBlockEnabled)),
+      initialUserScripts:
+          UnmodifiableListView(_initialScripts(adBlockEnabled, initialUrl)),
       initialSettings: InAppWebViewSettings(
         javaScriptEnabled: true,
         mediaPlaybackRequiresUserGesture: false,
@@ -378,7 +411,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         supportMultipleWindows: true,
         javaScriptCanOpenWindowsAutomatically: true,
         userAgent: _desktopMode ? _desktopUA : null,
-        contentBlockers: adBlockEnabled ? _contentBlockers : [],
+        contentBlockers: _contentBlockersForPage(initialUrl, adBlockEnabled),
       ),
       onWebViewCreated: (controller) {
         tab.controller = controller;
@@ -420,9 +453,14 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         }
         return false; // we handle it ourselves
       },
-      onLoadStart: (controller, url) {
+      onLoadStart: (controller, url) async {
         if (!mounted) return;
         final pageUrl = url?.toString() ?? '';
+        await _applyBlockingModeForTab(
+          controller,
+          pageUrl,
+          ref.read(settingsProvider).adBlockEnabled,
+        );
         setState(() {
           tab.url = pageUrl;
           tab.progress = 0;
@@ -454,7 +492,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
         }
         final settings = ref.read(settingsProvider);
         if (settings.adBlockEnabled) {
-          await _injectAdBlockScripts(controller);
+          await _injectAdBlockScripts(controller, pageUrl);
         } else {
           // Re-inject video detector even when ad blocking is disabled.
           await controller.evaluateJavascript(
@@ -805,6 +843,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
     final cs = Theme.of(context).colorScheme;
     final hasCastable = _castableCount > 0;
     final settings = ref.watch(settingsProvider);
+    final nativeCastState = ref.watch(nativeCastProvider);
 
     if (_adBlockAppliedValue != settings.adBlockEnabled) {
       _adBlockAppliedValue = settings.adBlockEnabled;
@@ -815,7 +854,7 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
 
     return Scaffold(
       appBar: AppBar(
-        titleSpacing: 0,
+        titleSpacing: 12,
         title: _buildUrlBar(cs),
         actions: [
           // ── Cast button — the star of the show ──
@@ -832,6 +871,18 @@ class _BrowserScreenState extends ConsumerState<BrowserScreen>
               tooltip: 'No videos detected',
               onPressed: null, // disabled look
             ),
+          IconButton(
+            icon: Icon(
+              nativeCastState.connected
+                  ? Icons.cast_connected_rounded
+                  : Icons.cast_outlined,
+              size: 20,
+            ),
+            tooltip: nativeCastState.connected
+                ? 'Connected to ${nativeCastState.deviceName ?? 'Chromecast'}'
+                : 'Connect Chromecast',
+            onPressed: () => ref.read(nativeCastProvider.notifier).showDialog(),
+          ),
           IconButton(
             icon: const Icon(Icons.refresh, size: 20),
             tooltip: 'Reload',
@@ -1889,9 +1940,20 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
   Widget _buildPreCastRow(
       ColorScheme cs, VideoLoaded videoState, DevicesState devicesState) {
     final selectedDevice = ref.watch(selectedDeviceProvider);
+    final nativeCastState = ref.watch(nativeCastProvider);
     final selectedFormat = ref.watch(selectedFormatProvider);
     final settings = ref.watch(settingsProvider);
     final lastDeviceLocation = ref.watch(lastDeviceProvider);
+    final effectiveCastDevice = selectedDevice ??
+        (nativeCastState.connected
+            ? DlnaDevice(
+                protocol: CastProtocol.chromecast,
+                name: nativeCastState.deviceName ?? 'Chromecast',
+                manufacturer: 'Google Cast',
+                location: 'cast://active-session',
+                controlUrl: '',
+              )
+            : null);
 
     // Gather available devices
     final List<DlnaDevice> devices;
@@ -1986,11 +2048,13 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                         const SizedBox(width: 8),
                         Expanded(
                           child: Text(
-                            selectedDevice?.name ??
-                                (isScanning ? 'Scanning…' : 'Select TV'),
+                            effectiveCastDevice?.name ??
+                              (isScanning
+                                ? 'Scanning DLNA TVs…'
+                                : 'Select TV or connect Cast'),
                             style: TextStyle(
                               fontSize: 12,
-                              color: selectedDevice != null
+                              color: effectiveCastDevice != null
                                   ? cs.onSurface
                                   : cs.onSurfaceVariant,
                             ),
@@ -2023,18 +2087,20 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                   textStyle: const TextStyle(
                       fontSize: 13, fontWeight: FontWeight.w600),
                 ),
-                onPressed: selectedDevice != null && selectedFormat != null
+                onPressed: effectiveCastDevice != null && selectedFormat != null
                     ? () {
                         ref.read(castHistoryProvider.notifier).add(
                               videoState.sourceUrl,
                               videoState.info.title,
                               videoState.info.thumbnailUrl,
                             );
-                        ref
-                            .read(lastDeviceProvider.notifier)
-                            .save(selectedDevice.location);
+                    if (selectedDevice != null) {
+                      ref
+                        .read(lastDeviceProvider.notifier)
+                        .save(selectedDevice.location);
+                    }
                         ref.read(castProvider.notifier).cast(
-                              device: selectedDevice,
+                        device: effectiveCastDevice,
                               format: selectedFormat,
                               title: videoState.info.title,
                               routeThroughPhone: settings.routeThroughPhone,
@@ -2161,7 +2227,8 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
       WidgetsBinding.instance.addPostFrameCallback((_) async {
         try {
           if (castState.device.protocol == CastProtocol.chromecast) {
-            if (mounted) setState(() => _volume ??= 50);
+            final v = await NativeCastService.getVolume();
+            if (mounted) setState(() => _volume = (v ?? 0.5) * 100);
           } else {
             final v =
                 await ref.read(dlnaServiceProvider).getVolume(castState.device);
@@ -2321,9 +2388,7 @@ class _BrowserCastPanelState extends ConsumerState<_BrowserCastPanel> {
                         setState(() => _volume = v);
                         if (castState.device.protocol ==
                             CastProtocol.chromecast) {
-                          await ref
-                              .read(chromecastServiceProvider)
-                              .setVolume(v / 100);
+                          await NativeCastService.setVolume(v / 100);
                         } else {
                           await ref
                               .read(dlnaServiceProvider)

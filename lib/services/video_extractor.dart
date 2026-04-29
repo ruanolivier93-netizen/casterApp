@@ -286,58 +286,30 @@ class VideoExtractorService {
 
       final doc = XmlDocument.parse(response.body);
       final baseUri = Uri.parse(url);
-      final formats = <StreamFormat>[];
-      int idx = 0;
-
-      for (final adaptSet in doc.findAllElements('AdaptationSet')) {
-        final mimeType = adaptSet.getAttribute('mimeType') ?? '';
-        final isVideo = mimeType.contains('video');
-        final isAudio = mimeType.contains('audio');
-
-        for (final rep in adaptSet.findElements('Representation')) {
-          final bandwidth = int.tryParse(rep.getAttribute('bandwidth') ?? '') ?? 0;
-          final height = int.tryParse(rep.getAttribute('height') ?? '') ?? 0;
-          final codecs = rep.getAttribute('codecs') ?? '';
-
-          // Get base URL from Representation or AdaptationSet
-          var streamUrl = url; // Default to MPD URL
-          final baseUrlEl = rep.findElements('BaseURL').firstOrNull ??
-              adaptSet.findElements('BaseURL').firstOrNull;
-          if (baseUrlEl != null) {
-            final bu = baseUrlEl.innerText.trim();
-            streamUrl = bu.startsWith('http') ? bu : baseUri.resolve(bu).toString();
-          }
-
-          final label = isVideo
-              ? '${height > 0 ? '${height}p' : '${(bandwidth / 1000).round()}k'} · $codecs${isAudio ? '' : ' · video only ⚠'}'
-              : 'Audio · $codecs · ${(bandwidth / 1000).round()} kbps';
-
-          formats.add(StreamFormat(
-            id: 'dash_${idx++}',
-            label: label,
-            url: streamUrl,
-            height: height,
-            hasAudio: isAudio || !isVideo, // Audio tracks always have audio
-          ));
-        }
+      int bestHeight = 0;
+      int bestBandwidth = 0;
+      for (final rep in doc.findAllElements('Representation')) {
+        final height = int.tryParse(rep.getAttribute('height') ?? '') ?? 0;
+        final bandwidth = int.tryParse(rep.getAttribute('bandwidth') ?? '') ?? 0;
+        if (height > bestHeight) bestHeight = height;
+        if (bandwidth > bestBandwidth) bestBandwidth = bandwidth;
       }
 
-      // Sort: videos first (by height desc), then audio
-      formats.sort((a, b) {
-        if (a.height > 0 && b.height == 0) return -1;
-        if (a.height == 0 && b.height > 0) return 1;
-        return b.height.compareTo(a.height);
-      });
+      final label = bestHeight > 0
+          ? 'DASH stream · up to ${bestHeight}p'
+          : bestBandwidth > 0
+              ? 'DASH stream · ${(bestBandwidth / 1000000).toStringAsFixed(1)} Mbps'
+              : 'DASH stream';
 
-      if (formats.isEmpty) {
-        formats.add(StreamFormat(
+      final formats = [
+        StreamFormat(
           id: 'dash_direct',
-          label: 'DASH stream',
+          label: label,
           url: url,
-          height: 0,
+          height: bestHeight,
           hasAudio: true,
-        ));
-      }
+        ),
+      ];
 
       final filename = baseUri.pathSegments.isNotEmpty
           ? Uri.decodeComponent(baseUri.pathSegments.last.split('?').first)

@@ -82,7 +82,6 @@ class _MainShellState extends ConsumerState<MainShell> {
 
   @override
   Widget build(BuildContext context) {
-    final cs = Theme.of(context).colorScheme;
     final isLandscape = MediaQuery.of(context).orientation == Orientation.landscape;
 
     return PopScope(
@@ -104,6 +103,7 @@ class _MainShellState extends ConsumerState<MainShell> {
         SystemNavigator.pop();
       },
       child: Scaffold(
+        backgroundColor: Colors.transparent,
         body: IndexedStack(
           index: _tabIndex,
           children: [
@@ -120,25 +120,9 @@ class _MainShellState extends ConsumerState<MainShell> {
         ),
         bottomNavigationBar: isLandscape
             ? null
-            : Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            // Mini player — smooth animated entrance above nav bar
-            const MiniPlayer(),
-            // Nav bar with a subtle top divider
-            DecoratedBox(
-              decoration: BoxDecoration(
-                border: Border(
-                  top: BorderSide(
-                    color: Theme.of(context).colorScheme.outlineVariant
-                        .withAlpha(60),
-                    width: 0.8,
-                  ),
-                ),
-              ),
-              child: NavigationBar(
+            : _SimpleBottomBar(
                 selectedIndex: _tabIndex,
-                onDestinationSelected: (i) {
+                onSelected: (i) {
                   if (i == 1 && !_browserInitialised) {
                     setState(() {
                       _browserInitialised = true;
@@ -148,28 +132,121 @@ class _MainShellState extends ConsumerState<MainShell> {
                     setState(() => _tabIndex = i);
                   }
                 },
-                height: 64,
-                indicatorColor: cs.primaryContainer,
-                destinations: const [
-                  NavigationDestination(
-                    icon: Icon(Icons.cast_outlined),
-                    selectedIcon: Icon(Icons.cast),
+              ),
+      ),
+    );
+  }
+}
+
+class _SimpleBottomBar extends StatelessWidget {
+  const _SimpleBottomBar({
+    required this.selectedIndex,
+    required this.onSelected,
+  });
+
+  final int selectedIndex;
+  final ValueChanged<int> onSelected;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return SafeArea(
+      top: false,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(12, 0, 12, 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const MiniPlayer(),
+            const SizedBox(height: 8),
+            Container(
+              decoration: BoxDecoration(
+                color: Theme.of(context).cardTheme.color,
+                borderRadius: BorderRadius.circular(24),
+                border: Border.all(color: cs.outlineVariant),
+              ),
+              padding: const EdgeInsets.all(6),
+              child: Row(
+                children: [
+                  _SimpleNavItem(
                     label: 'Cast',
+                    icon: Icons.cast_outlined,
+                    selectedIcon: Icons.cast,
+                    selected: selectedIndex == 0,
+                    onTap: () => onSelected(0),
                   ),
-                  NavigationDestination(
-                    icon: Icon(Icons.language_outlined),
-                    selectedIcon: Icon(Icons.language),
+                  _SimpleNavItem(
                     label: 'Browse',
+                    icon: Icons.language_outlined,
+                    selectedIcon: Icons.language,
+                    selected: selectedIndex == 1,
+                    onTap: () => onSelected(1),
                   ),
-                  NavigationDestination(
-                    icon: Icon(Icons.folder_outlined),
-                    selectedIcon: Icon(Icons.folder),
+                  _SimpleNavItem(
                     label: 'Files',
+                    icon: Icons.folder_outlined,
+                    selectedIcon: Icons.folder,
+                    selected: selectedIndex == 2,
+                    onTap: () => onSelected(2),
                   ),
                 ],
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _SimpleNavItem extends StatelessWidget {
+  const _SimpleNavItem({
+    required this.label,
+    required this.icon,
+    required this.selectedIcon,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final IconData selectedIcon;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final cs = Theme.of(context).colorScheme;
+    return Expanded(
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 180),
+        curve: Curves.easeOut,
+        margin: const EdgeInsets.symmetric(horizontal: 2),
+        decoration: BoxDecoration(
+          color: selected ? (Theme.of(context).brightness == Brightness.dark ? const Color(0xFF23272B) : const Color(0xFFE7E0D6)) : Colors.transparent,
+          borderRadius: BorderRadius.circular(18),
+        ),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(18),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(selected ? selectedIcon : icon, color: selected ? cs.primary : cs.onSurfaceVariant, size: 21),
+                const SizedBox(height: 4),
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: selected ? FontWeight.w700 : FontWeight.w600,
+                    color: selected ? cs.onSurface : cs.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
       ),
     );
